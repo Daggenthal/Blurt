@@ -1,0 +1,80 @@
+# Blurt
+
+Blurt is a re-implementation of [Soundpad](https://store.steampowered.com/app/629520/Soundpad/) for Linux. Soundpad is Windows only, and there is currently no way to get it working on Linux without a lot of troubleshooting. Blurt does the same job natively: it plays audio files through your microphone so other people hear them in Discord, in game voice chat, or anywhere else that takes a mic.
+
+![Main window](screenshots/main.png)
+
+## What it does
+
+While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick that as the input device in your voice app. Others then hear your real microphone plus whatever you play, and you hear the sounds on the output device you choose.
+
+## Features
+
+- **Soundboard:** import audio files (mp3, wav, ogg, opus, flac, m4a and more), play, pause, stop, seek, or play a random one.
+- **Hotkeys:** bind any sound to a key or key combination. Stop, pause, random and the clip actions can be bound too. Hotkeys work while a game is focused.
+- **Device selection:** choose which microphone feeds the mix and which output you listen on.
+- **Separate volumes:** one slider for how loud others hear a sound, one for how loud you hear it.
+- **Folders:** import a whole folder tree at once, or create, rename and delete folders inside Blurt. Drag and drop works.
+- **Clipping:** Blurt keeps a rolling buffer of what plays on your output. Press a hotkey to clip the last 0.2 to 30 seconds, replay it through the mic, edit it, or save it to your library. Blurt's own playback is left out of the clip.
+- **Editor:** a waveform view where you select, trim, cut, zoom and undo, with a preview that only you hear.
+- **Effects:** noise reduction, click removal, noise gate, amplify, normalize, fades, reverse, silence, repeat, speed, pitch, echo, reverb, bass boost, distortion, telephone and robot. Each one can be previewed before it is applied.
+- **Real files:** your library is stored as normal files in `~/.local/share/blurt/sounds/`, in folders that match the ones in the app.
+
+![Editor](screenshots/editor.png)
+
+## Requirements
+
+- Linux with PipeWire (with `pipewire-pulse`) or PulseAudio
+- Python 3 with `venv`
+- `pactl` and `parec` (part of `libpulse` or `pulseaudio-utils`)
+- `pw-dump` and `pw-link` (part of PipeWire) to keep Blurt's own playback out of clips
+
+SteamOS already ships all of these.
+
+## Install
+
+```bash
+git clone https://github.com/Daggenthal/blurt.git
+cd blurt
+bash install.sh
+```
+
+The installer needs no root. It puts everything in your home folder: a Python environment with PySide6 and numpy in `~/.local/share/blurt/`, a launcher in `~/.local/bin/blurt`, and a menu entry.
+
+For hotkeys that work while another window is focused, add yourself to the `input` group once, then log out and back in:
+
+```bash
+sudo usermod -aG input $USER
+```
+
+On SteamOS you need to set a password with `passwd` first. Without this step, hotkeys only work while the Blurt window is focused.
+
+To update, pull the latest version and run `bash install.sh` again. Your sounds, folders and hotkeys are kept.
+
+## Run
+
+Start **Blurt** from your application menu, or run:
+
+```bash
+~/.local/bin/blurt
+```
+
+Then:
+
+1. Select **Blurt-Mic** as the microphone in Discord or your game.
+2. In Blurt, pick your real microphone under Input and your headphones or speakers under Output.
+3. Import some sounds, right-click one and choose **Set hotkey**.
+
+## Tested on
+
+A Steam Machine running SteamOS with the default KDE Plasma desktop. Other distributions with PipeWire should work but have not been tested.
+
+## Notes
+
+- Hotkeys are observed, not captured, so the key press still reaches the game. Bind keys the game does not use.
+- The virtual microphone only exists while Blurt is running.
+- Sounds saved from the editor are stored as WAV.
+
+## License
+
+[MIT](LICENSE)
