@@ -1843,6 +1843,84 @@ class VoiceLive:
                 self._write(y, "voice")
 
 
+ENGINE_LOG = DATA_DIR / "voice-engine.log"
+
+
+class EngineInfo:
+    """What the engine process reported when it started (device, PyTorch version...)."""
+
+    def __init__(self, info):
+        info = dict(info)
+        self._describe = info.pop("describe", "CPU")
+        self.__dict__.update(info)
+
+    def describe(self):
+        return self._describe
+
+
+class VoiceProxy:
+    """A voice model loaded in the engine process."""
+
+    def __init__(self, client, vid, meta):
+        self.client, self.vid = client, vid
+        self.__dict__.update(meta)
+        self.index = self.index_info  # truthy when an index is in use
+
+    def convert(self, audio, sr, shift, index_rate, protect):
+        """Returns (audio at 48 kHz, 48000)."""
+        y = self.client.call("convert", self.vid, np.asarray(audio, np.float32), sr, shift,
+                             index_rate, protect)
+        return y, VOICE_RATE
+
+
+class StreamProxy:
+    """Live conversion running in the engine process; looks like engine.RVCStream."""
+
+    def __init__(self, client, vid, block_s, context_s, shift, index_rate, protect):
+        self.client = client
+        meta = client.call("stream_new", vid, block_s, context_s, shift, index_rate, protect)
+        self.block, self.cross, self.context_s = meta["block"], meta["cross"], meta["context_s"]
+        self._shift, self._index_rate, self._protect = shift, index_rate, protect
+        self.last_cost, self._latency, self.rows, self.silent_blocks = 0.0, 0.0, [], 0
+        self.failed = None
+
+    def process(self, block):
+        if self.failed:
+            return np.zeros(len(block), np.float32)
+        try:
+            y, self.last_cost, self._latency, self.rows, self.silent_blocks = \
+                self.client.call("stream", block)
+            return y
+        except Exception as e:
+            self.failed = str(e)
+            return np.zeros(len(block), np.float32)
+
+    def latency(self):
+        return self._latency
+
+    def report_rows(self):
+        return self.rows
+
+    def reset_stats(self):
+        try:
+            self.client.call("stream_reset")
+        except Exception:
+            pass
+
+    def _push(self):
+        try:
+            self.client.call("stream_set", self._shift, self._index_rate, self._protect)
+        except Exception:
+            pass
+
+    shift = property(lambda self: self._shift,
+                     lambda self, v: (setattr(self, "_shift", v), self._push()))
+    index_rate = property(lambda self: self._index_rate,
+                          lambda self, v: (setattr(self, "_index_rate", v), self._push()))
+    protect = property(lambda self: self._protect,
+                       lambda self, v: (setattr(self, "_protect", v), self._push()))
+
+
 class VoiceDialog(QtWidgets.QDialog):
     def __init__(self, win):
         super().__init__(win)
@@ -1855,7 +1933,9 @@ class VoiceDialog(QtWidgets.QDialog):
         cfg.setdefault("b1", dict(B1_DEFAULTS))
         cfg.setdefault("responsiveness", "auto")
         self.cfg = cfg
-        self.helpers = None          # shared AI helper networks, loaded once
+        self.helpers = None          # EngineInfo once the engine process has started
+        from blurt_voice.rvc.client import EngineClient
+        self.client = EngineClient(Path(__file__).resolve().parent, ENGINE_LOG)
         self.voices = {}             # model id -> loaded RVCVoice
         self.loading = False
         self.test_raw = self.test_out = None
@@ -2469,8 +2549,8 @@ class VoiceDialog(QtWidgets.QDialog):
         if not Path(model["pth"]).is_file():
             self.status.setText(f"The model file is missing: {model['pth']}")
             return
-        from blurt_voice.rvc import engine
-        missing = engine.assets_missing(AI_ASSETS)
+        from blurt_voice.rvc.assets import assets_missing
+        missing = assets_missing(AI_ASSETS)
         if missing:
             if QtWidgets.QMessageBox.question(
                     self, "Download voice engine",
@@ -2485,27 +2565,24 @@ class VoiceDialog(QtWidgets.QDialog):
         mid, pth, index = model["id"], model["pth"], model.get("index") or None
 
         def work(progress):
-            def report(name, done, total):
-                pct = f" {done * 100 // total}%" if total else ""
-                progress(f"Downloading {name}{pct} ({done // 1048576} MB)")
-            engine.download_assets(AI_ASSETS, report)
-            engine.set_threads()
-            if self.helpers is None:
-                progress("Starting the voice engine…")
-                self.helpers = engine.Helpers(
-                    AI_ASSETS, device=engine.pick_device(self.cfg.get("use_gpu", True)),
-                    fast_math=self.cfg.get("fast_math", True))
-            progress(f"Loading {model['name']}… (the first time, a big .index file can take "
-                     "a minute to prepare)")
-            voice = engine.RVCVoice(self.helpers, pth, index)
-            progress("Measuring how fast this computer runs the voice…")
-            voice.speed = engine.benchmark(voice)
-            return voice
+            # everything with PyTorch happens in the separate engine process
+            if self.helpers is None or not self.client.running():
+                self.helpers = None
+                self.voices.clear()
+                info = self.client.call("start", str(AI_ASSETS), self.cfg.get("use_gpu", True),
+                                        self.cfg.get("fast_math", True), progress=progress)
+                self.helpers = EngineInfo(info)
+            meta = self.client.call("load", mid, pth, index, progress=progress)
+            return VoiceProxy(self.client, mid, meta)
 
         def finished(voice, error):
             self.loading = False
             if error:
                 self.status.setText(f"Could not load the voice: {error}")
+                tail = self.client.log_tail(6)
+                if "stopped unexpectedly" in str(error) and tail:
+                    self.status.setText(f"Could not load the voice: {error}\nLast lines of "
+                                        f"the engine log:\n{tail}")
             else:
                 self.voices[mid] = voice
                 note = "" if voice.index is not None or not index else \
@@ -2514,7 +2591,7 @@ class VoiceDialog(QtWidgets.QDialog):
                 self.store.save()
                 pick = self._auto_responsiveness()
                 if self.cfg.get("use_gpu", True) and self.helpers.device != "cuda":
-                    note += f" (graphics card not used: {engine.GPU_ERROR})"
+                    note += f" (graphics card not used: {self.helpers.gpu_error})"
                 self.status.setText(
                     f"{model['name']} is ready{note}. Running on the {self.helpers.describe()} "
                     f"at {voice.speed * 100:.0f}% of real time, so Auto live mode uses "
@@ -2555,6 +2632,8 @@ class VoiceDialog(QtWidgets.QDialog):
             return
         self.helpers = None  # rebuilt with the new option
         self.voices.clear()
+        self.win.live.stop()
+        self.client.stop()  # a fresh engine process picks up the new option
         self.win.update_mic_pipeline()  # normal (gated) mic while the engine reloads
         model = self._model()
         if model:
@@ -2590,14 +2669,16 @@ class VoiceDialog(QtWidgets.QDialog):
             return B1Droid(b["pitch"], b["size"], b["metal"]), 0
         model = self._model()
         if model and self._ai_ready(model):
-            from blurt_voice.rvc import engine
             key = self.cfg["responsiveness"]
             if key == "auto":
                 key = self._auto_responsiveness()
             _label, block, context = RESPONSIVENESS[key]
-            stream = engine.RVCStream(self.voices[model["id"]], block_s=block, context_s=context,
-                                      shift=model["pitch"], index_rate=model["index_rate"] / 100,
-                                      protect=model["protect"] / 100)
+            try:
+                stream = StreamProxy(self.client, model["id"], block, context, model["pitch"],
+                                     model["index_rate"] / 100, model["protect"] / 100)
+            except Exception as e:
+                self._engine_failed(str(e))
+                return None, 0
             return stream, stream.block
         return None, 0
 
@@ -2663,7 +2744,6 @@ class VoiceDialog(QtWidgets.QDialog):
                                     "the main window.")
             model = self._model()
             if model and self.helpers is not None:
-                from blurt_voice.rvc import engine
                 self.status.setText("Measuring your voice…")
 
                 def measured(pitch, err):
@@ -2672,7 +2752,7 @@ class VoiceDialog(QtWidgets.QDialog):
                         self.store.save()
                         self._apply_auto_pitch(model)
                     self._convert_test()
-                Background(self, lambda _p: engine.voice_pitch(self.helpers, audio, VOICE_RATE),
+                Background(self, lambda _p: self.client.call("pitch", audio, VOICE_RATE),
                            measured)
                 return
             self._convert_test()
@@ -2705,9 +2785,8 @@ class VoiceDialog(QtWidgets.QDialog):
         started = time.perf_counter()
 
         def work(_progress):
-            y, sr = voice.convert(raw, VOICE_RATE, *settings)
-            from blurt_voice.rvc.engine import resample
-            return resample(y, sr, VOICE_RATE)
+            y, _sr = voice.convert(raw, VOICE_RATE, *settings)  # already 48 kHz
+            return y
 
         def finished(out, error):
             if error:
@@ -2772,7 +2851,27 @@ class VoiceDialog(QtWidgets.QDialog):
                                      "Pick a voice above to use it live.")
         self.win.update_mic_pipeline()
 
+    def _engine_failed(self, why):
+        self.helpers = None
+        self.voices.clear()
+        self.on_mic.blockSignals(True)
+        self.on_mic.setChecked(False)
+        self.on_mic.blockSignals(False)
+        self.monitor.blockSignals(True)
+        self.monitor.setChecked(False)
+        self.monitor.blockSignals(False)
+        self.win.update_mic_pipeline()
+        tail = self.client.log_tail(6)
+        self.status.setText(f"The voice engine failed, so the live voice was turned off and "
+                            f"others hear your normal mic. {why}" +
+                            (f"\nLast lines of the engine log:\n{tail}" if tail else ""))
+        self._update_test_buttons()
+
     def _update_live_status(self):
+        failed = getattr(self.live.processor, "failed", None)
+        if self.live.running and failed:
+            self._engine_failed(failed)
+            return
         if not self.live.running or self.live.processor is None:
             if (self.on_mic.isChecked() or self.monitor.isChecked()) and \
                     self.cfg["mode"] != "off" and not self.voice_ready():
@@ -2812,6 +2911,7 @@ class VoiceDialog(QtWidgets.QDialog):
 
     def shutdown(self):
         self.player.stop()
+        self.client.stop()
 
     def closeEvent(self, ev):
         self.player.stop()
@@ -2839,17 +2939,17 @@ def _cpu_info():
     return info
 
 
-def _process_cpu_seconds():
+def _process_cpu_seconds(pid="self"):
     try:
-        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError):
         return None
 
 
-def _rss_mb():
+def _rss_mb(pid="self"):
     try:
-        m = re.search(r"VmRSS:\s+(\d+)", Path("/proc/self/status").read_text())
+        m = re.search(r"VmRSS:\s+(\d+)", Path(f"/proc/{pid}/status").read_text())
         return int(m.group(1)) // 1024 if m else None
     except OSError:
         return None
@@ -2887,8 +2987,10 @@ class PerfDialog(QtWidgets.QDialog):
             row.addWidget(b)
         lay.addLayout(row)
         self.cpu = _cpu_info()
-        self._last_cpu = (_process_cpu_seconds(), time.monotonic())
+        self._last_cpu = (None, time.monotonic())
+        self._engine_pid = None
         self._blurt_cpu = None
+        self._diag = None
         self._last_log = 0.0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -2897,18 +2999,25 @@ class PerfDialog(QtWidgets.QDialog):
 
     def reset(self):
         proc = self.voice_dlg.live.processor
-        if proc is not None and hasattr(proc, "stats"):
-            proc.stats.clear()
+        if proc is not None and hasattr(proc, "reset_stats"):
+            proc.reset_stats()
         live = self.voice_dlg.live
         live.dropped = live.blocks = live.max_queue = 0
 
     def _blurt_cpu_percent(self):
-        now_cpu, now = _process_cpu_seconds(), time.monotonic()
+        proc = self.voice_dlg.client.proc
+        pid = proc.pid if proc is not None and proc.poll() is None else None
+        now = time.monotonic()
+        now_cpu = (_process_cpu_seconds(), _process_cpu_seconds(pid) if pid else None)
         last_cpu, last = self._last_cpu
         self._last_cpu = (now_cpu, now)
-        if now_cpu is None or last_cpu is None or now - last <= 0:
+        self._engine_pid = pid
+        if not isinstance(last_cpu, tuple) or now - last <= 0:
             return None
-        return (now_cpu - last_cpu) / (now - last) * 100  # 100% = one full core
+        out = []
+        for a, b in zip(now_cpu, last_cpu):
+            out.append(None if a is None or b is None else (a - b) / (now - last) * 100)
+        return out  # [window, engine]; 100% = one full core
 
     def report(self):
         d, live = self.voice_dlg, self.voice_dlg.live
@@ -2924,7 +3033,7 @@ class PerfDialog(QtWidgets.QDialog):
         if hasattr(proc, "block"):
             budget = proc.block / VOICE_RATE * 1000
             lines.append(f"Block: {budget:.0f} ms of audio per step (time budget {budget:.0f} ms), "
-                         f"context {len(proc.buf16) / 16000 - proc.tail16 / 16000:.2f} s, "
+                         f"context {proc.context_s:.2f} s, "
                          f"crossfade {proc.cross / VOICE_RATE * 1000:.0f} ms")
             lines.append(f"Blocks converted: {live.blocks}, skipped (too slow): {live.dropped}, "
                          f"silent (not converted): {proc.silent_blocks}, "
@@ -2979,24 +3088,27 @@ class PerfDialog(QtWidgets.QDialog):
                                  "games or other heavy programs while using the AI voice.")
         except OSError:
             pass
-        usage = self._blurt_cpu
-        if usage is not None:
-            lines.append(f"  Blurt is using {usage:.0f}% CPU (100% = one core)")
-        rss = _rss_mb()
+        usage = self._blurt_cpu or [None, None]
+        if usage[0] is not None:
+            lines.append(f"  Blurt window is using {usage[0]:.0f}% CPU (100% = one core)")
+        if usage[1] is not None:
+            lines.append(f"  Voice engine process is using {usage[1]:.0f}% CPU")
+        rss, erss = _rss_mb(), (_rss_mb(self._engine_pid) if self._engine_pid else None)
         if rss:
-            lines.append(f"  Blurt memory: {rss} MB")
+            lines.append(f"  Memory: window {rss} MB" + (f", voice engine {erss} MB" if erss else ""))
         if d.helpers is not None:
-            import torch
-            lines.append(f"  Voice engine: {d.helpers.describe()}, torch {torch.__version__}, "
-                         f"{torch.get_num_threads()} threads")
-            if d.helpers.device == "cuda":
-                try:
-                    lines.append(f"  Graphics card: {torch.cuda.get_device_name(0)}")
-                except Exception:
-                    pass
+            h = d.helpers
+            lines.append(f"  Voice engine: {h.describe()}, torch {h.torch}, {h.threads} threads "
+                         "(separate process)")
+            if h.device == "cuda":
+                lines.append(f"  Graphics card: {h.gpu_name}")
             else:
-                from blurt_voice.rvc import engine
-                gpu_lines, gpu_advice = engine.gpu_diagnosis()
+                if self._diag is None:
+                    try:
+                        self._diag = d.client.call("diag")
+                    except Exception as e:
+                        self._diag = ([f"could not check: {e}"], [])
+                gpu_lines, gpu_advice = self._diag
                 lines.append("")
                 lines.append("Graphics card (why it is not used)")
                 lines += [f"  {t}" for t in gpu_lines]
@@ -3004,9 +3116,8 @@ class PerfDialog(QtWidgets.QDialog):
         if model and model["id"] in d.voices:
             v = d.voices[model["id"]]
             idx = "none"
-            if v.index is not None:
-                kind = type(v.index).__name__
-                idx = f"{kind}, {v.index.ntotal:,} entries"
+            if v.index_info:
+                idx = f"{v.index_info[0]}, {v.index_info[1]:,} entries"
             size = Path(model["pth"]).stat().st_size // 1048576 if Path(model["pth"]).exists() else 0
             lines.append("")
             lines.append("Model")
@@ -4107,6 +4218,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    import faulthandler
+    try:  # if Blurt itself ever crashes hard, say where
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        faulthandler.enable(open(DATA_DIR / "crash.log", "a"), all_threads=True)
+    except OSError:
+        pass
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setDesktopFileName("blurt")
