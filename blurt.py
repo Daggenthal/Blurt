@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 import wave
+import zipfile
 from array import array
 from collections import deque
 from pathlib import Path
@@ -33,6 +34,11 @@ try:
     import numpy as np  # only the editor's effects need it
 except ImportError:
     np = None
+
+try:
+    from blurt_voice.dsp import B1Droid  # live voice effects (numpy only)
+except ImportError:
+    B1Droid = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -241,6 +247,9 @@ class Router:
 
     def set_mic(self, source_name):
         """Feed the real microphone into the mix (None = sounds only)."""
+        if source_name == getattr(self, "loop_source", None) and (self.loop_module or not source_name):
+            return
+        self.loop_source = source_name
         if self.loop_module:
             pactl("unload-module", self.loop_module)
             self.loop_module = None
@@ -486,7 +495,8 @@ class OutputTee:
                 c = clients.get(p.get("client.id"), {})
                 return (str(p.get("application.process.id")) == me
                         or str(c.get("application.process.id")) == me
-                        or str(p.get("node.name", "")).startswith("blurt_"))
+                        or str(p.get("node.name", "")).startswith("blurt_")
+                        or str(p.get("application.name", "")).startswith("Blurt voice"))
 
             sink, cap = by_name(target), by_name(CAP_SINK)
             if sink is None or cap is None or sink == cap:
@@ -1608,9 +1618,758 @@ def show_in_file_manager(path):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
 
 
+# --------------------------------------------------------------------------
+# Voice changer: live effects on your microphone, plus AI voices (RVC models)
+# --------------------------------------------------------------------------
+VOICE_RATE = 48000
+VOICE_DIR = DATA_DIR / "voices"   # models unpacked from .zip files
+AI_ASSETS = DATA_DIR / "ai"       # shared helper networks, downloaded on first use
+RESPONSIVENESS = {  # key: (label, block seconds, context seconds)
+    "fast": ("Fast (shorter delay, more glitches)", 0.3, 0.8),
+    "balanced": ("Balanced", 0.45, 1.0),
+    "smooth": ("Smooth (longer delay)", 0.7, 1.2),
+}
+TEST_SECONDS = 5
+B1_DEFAULTS = {"pitch": 3, "size": 25, "metal": 60}
+
+
+def ai_voice_installed():
+    import importlib.util
+    return np is not None and all(importlib.util.find_spec(m) is not None
+                                  for m in ("torch", "transformers", "scipy"))
+
+
+def to_wav_pcm(mono, rate):
+    """Mono float audio at any rate -> 48 kHz stereo int16 bytes (what write_wav expects)."""
+    mono = np.asarray(mono, dtype=np.float32)
+    if rate != ED_RATE and len(mono):
+        n = int(round(len(mono) * ED_RATE / rate))
+        mono = np.interp(np.linspace(0, len(mono) - 1, n), np.arange(len(mono)), mono)
+    stereo = np.repeat(np.clip(mono, -1, 1)[:, None], 2, axis=1)
+    return (stereo * 32767).astype(np.int16).tobytes()
+
+
+class Background(QtCore.QObject):
+    """Run a function on a worker thread; done(result, error) arrives on the GUI thread."""
+    done = QtCore.Signal(object, object)
+    progress = QtCore.Signal(str)
+
+    def __init__(self, parent, fn, on_done, on_progress=None):
+        super().__init__(parent)
+        self.done.connect(lambda r, e: (on_done(r, e), self.deleteLater()))
+        if on_progress:
+            self.progress.connect(on_progress)
+        threading.Thread(target=self._run, args=(fn,), daemon=True).start()
+
+    def _run(self, fn):
+        try:
+            result = fn(self.progress.emit)
+            self.done.emit(result, None)
+        except Exception as e:  # shown to the user
+            self.done.emit(None, e)
+
+
+class VoiceLive:
+    """Mic -> processor -> Blurt-Mic and/or your headphones, via parec/pacat."""
+    CHUNK = 480  # 10 ms
+
+    def __init__(self):
+        self.reader = None
+        self.outs = {}
+        self.lock = threading.Lock()
+        self.running = False
+        self.processor = None
+        self.block = 0
+        self.cost = 0.0      # processing time as a fraction of real time
+        self.dropped = 0
+        self.queue = deque()
+        self.wake = threading.Event()
+        self.gen = 0  # bumps on every (re)start so old threads quit
+
+    def start(self, source, processor, block=0):
+        """block=0: process every 10 ms chunk inline (DSP). Otherwise fixed blocks (AI)."""
+        self.stop()
+        self.processor, self.block = processor, block
+        self.cost, self.dropped = 0.0, 0
+        self.gen += 1
+        self.running = True
+        self.reader = subprocess.Popen(
+            ["parec", f"--device={source}", "--format=float32le", f"--rate={VOICE_RATE}",
+             "--channels=1", "--latency-msec=10", "--raw", "--client-name=Blurt voice input"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._read, args=(self.reader, self.gen), daemon=True).start()
+        if block:
+            threading.Thread(target=self._work, args=(self.gen,), daemon=True).start()
+
+    def set_output(self, name, sink):
+        with self.lock:
+            old = self.outs.pop(name, None)
+            if old:
+                try:
+                    old.stdin.close()
+                except OSError:
+                    pass
+                old.terminate()
+            if sink:
+                self.outs[name] = subprocess.Popen(
+                    ["pacat", "--playback", f"--device={sink}", "--format=float32le",
+                     f"--rate={VOICE_RATE}", "--channels=1", "--latency-msec=30", "--raw",
+                     f"--client-name=Blurt voice {name}"],
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def stop(self):
+        self.running = False
+        self.wake.set()
+        if self.reader:
+            self.reader.terminate()
+            self.reader = None
+        self.queue.clear()
+
+    def close(self):
+        self.stop()
+        for name in list(self.outs):
+            self.set_output(name, None)
+
+    def _write(self, y):
+        data = np.asarray(y, dtype="<f4").tobytes()
+        with self.lock:
+            for name, proc in list(self.outs.items()):
+                try:
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    self.outs.pop(name, None)
+
+    def _read(self, reader, gen):
+        size = self.CHUNK * 4
+        pending = []
+        have = 0
+        while self.running and gen == self.gen:
+            data = reader.stdout.read(size)
+            if not data:
+                break
+            x = np.frombuffer(data, dtype="<f4").astype(np.float32)
+            if not self.block:
+                t0 = time.perf_counter()
+                y = self.processor.process(x)
+                spent = (time.perf_counter() - t0) / (len(x) / VOICE_RATE)
+                self.cost += (spent - self.cost) * 0.05
+                self._write(y)
+                continue
+            pending.append(x)
+            have += len(x)
+            if have >= self.block:
+                joined = np.concatenate(pending)
+                self.queue.append(joined[:self.block])
+                rest = joined[self.block:]
+                pending, have = ([rest], len(rest)) if len(rest) else ([], 0)
+                while len(self.queue) > 2:  # falling behind: skip audio to keep the delay down
+                    self.queue.popleft()
+                    self.dropped += 1
+                self.wake.set()
+
+    def _work(self, gen):
+        while self.running and gen == self.gen:
+            self.wake.wait(0.5)
+            self.wake.clear()
+            while self.running and gen == self.gen and self.queue:
+                block = self.queue.popleft()
+                try:
+                    y = self.processor.process(block)
+                except Exception:
+                    y = np.zeros(len(block), np.float32)
+                if gen != self.gen:
+                    break
+                self.cost += (self.processor.last_cost / (len(block) / VOICE_RATE)
+                              - self.cost) * 0.3
+                self._write(y)
+
+
+class VoiceDialog(QtWidgets.QDialog):
+    def __init__(self, win):
+        super().__init__(win)
+        self.win, self.store = win, win.store
+        self.setWindowTitle("Voice changer")
+        self.resize(720, 560)
+        cfg = self.store.settings.setdefault("voice", {})
+        cfg.setdefault("models", [])
+        cfg.setdefault("mode", "off")
+        cfg.setdefault("b1", dict(B1_DEFAULTS))
+        cfg.setdefault("responsiveness", "balanced")
+        self.cfg = cfg
+        self.live = VoiceLive()
+        self.helpers = None          # shared AI helper networks, loaded once
+        self.voices = {}             # model id -> loaded RVCVoice
+        self.loading = False
+        self.test_raw = self.test_out = None
+        self.player = QMediaPlayer(self)
+        self.player_out = QAudioOutput(self)
+        self.player.setAudioOutput(self.player_out)
+        self._build()
+        self._fill_voices()
+        self._mode_changed()
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._update_live_status)
+        self.timer.start(500)
+
+    # ---- layout ----------------------------------------------------------
+    def _build(self):
+        W = QtWidgets
+        lay = W.QVBoxLayout(self)
+        row = W.QHBoxLayout()
+        row.addWidget(W.QLabel("Voice:"))
+        self.mode = W.QComboBox()
+        self.mode.setMinimumWidth(260)
+        self.mode.activated.connect(lambda _i: self._mode_chosen())
+        row.addWidget(self.mode, 1)
+        add = W.QPushButton("Add AI voice model…")
+        add.clicked.connect(self.add_model)
+        self.remove_btn = W.QPushButton("Remove")
+        self.remove_btn.clicked.connect(self.remove_model)
+        row.addWidget(add)
+        row.addWidget(self.remove_btn)
+        lay.addLayout(row)
+
+        # settings for the droid
+        self.b1_box = W.QGroupBox("B1 Battle Droid")
+        form = W.QFormLayout(self.b1_box)
+        self.b1_sliders = {}
+        for key, label, lo, hi, unit in (("pitch", "Pitch", -12, 12, " semitones"),
+                                         ("size", "Size (higher = smaller droid)", -30, 60, "%"),
+                                         ("metal", "Metal", 0, 100, "%")):
+            self.b1_sliders[key] = self._slider(form, label, lo, hi, self.cfg["b1"][key], unit,
+                                                lambda v, k=key: self._b1_changed(k, v))
+        reset = W.QPushButton("Reset to preset")
+        reset.clicked.connect(self._b1_reset)
+        form.addRow("", reset)
+        lay.addWidget(self.b1_box)
+
+        # settings for AI models
+        self.ai_box = W.QGroupBox("AI voice")
+        form = W.QFormLayout(self.ai_box)
+        self.ai_files = W.QLabel()
+        self.ai_files.setWordWrap(True)
+        self.ai_files.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Files:", self.ai_files)
+        idx_btn = W.QPushButton("Choose .index file…")
+        idx_btn.clicked.connect(self.choose_index)
+        form.addRow("", idx_btn)
+        self.ai_sliders = {
+            "pitch": self._slider(form, "Pitch shift", -24, 24, 12, " semitones",
+                                  lambda v: self._ai_changed("pitch", v)),
+            "index_rate": self._slider(form, "Voice match (index)", 0, 100, 75, "%",
+                                       lambda v: self._ai_changed("index_rate", v)),
+            "protect": self._slider(form, "Protect breaths and consonants", 0, 50, 33, "%",
+                                    lambda v: self._ai_changed("protect", v)),
+        }
+        self.resp = W.QComboBox()
+        for key, (label, _b, _c) in RESPONSIVENESS.items():
+            self.resp.addItem(label, key)
+        self.resp.setCurrentIndex(max(0, self.resp.findData(self.cfg["responsiveness"])))
+        self.resp.activated.connect(self._resp_changed)
+        form.addRow("Live responsiveness:", self.resp)
+        hint = W.QLabel("<small>Pitch shift: about +12 for a deep voice to a high one, "
+                        "0 if your voice is already similar.</small>")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        lay.addWidget(self.ai_box)
+
+        # testing
+        test = W.QGroupBox(f"Test - record {TEST_SECONDS} seconds and hear the result "
+                           "(nobody else hears it)")
+        tl = W.QVBoxLayout(test)
+        trow = W.QHBoxLayout()
+        self.rec_btn = W.QPushButton(f"● Record {TEST_SECONDS} s test")
+        self.rec_btn.clicked.connect(self.record_test)
+        self.play_btn = W.QPushButton("▶ Play with voice")
+        self.play_btn.clicked.connect(lambda: self._play_test(self.test_out))
+        self.orig_btn = W.QPushButton("▶ Play original")
+        self.orig_btn.clicked.connect(lambda: self._play_test(self.test_raw))
+        self.redo_btn = W.QPushButton("Apply current settings again")
+        self.redo_btn.setToolTip("Re-run the voice on the same recording after changing "
+                                 "a setting")
+        self.redo_btn.clicked.connect(self._convert_test)
+        self.save_test_btn = W.QPushButton("Save to library…")
+        self.save_test_btn.clicked.connect(self.save_test)
+        for b in (self.rec_btn, self.play_btn, self.orig_btn, self.redo_btn, self.save_test_btn):
+            trow.addWidget(b)
+        trow.addStretch(1)
+        tl.addLayout(trow)
+        lay.addWidget(test)
+
+        # live
+        live = W.QGroupBox("Live")
+        ll = W.QVBoxLayout(live)
+        self.on_mic = W.QCheckBox("Others hear this voice (on Blurt-Mic)")
+        self.on_mic.toggled.connect(self._live_changed)
+        self.monitor = W.QCheckBox("Hear myself live")
+        self.monitor.setToolTip("Plays your changed voice in your headphones. Use headphones, "
+                                "or the speakers will feed back into the mic.")
+        self.monitor.toggled.connect(self._live_changed)
+        ll.addWidget(self.on_mic)
+        ll.addWidget(self.monitor)
+        self.live_status = W.QLabel("")
+        self.live_status.setWordWrap(True)
+        ll.addWidget(self.live_status)
+        lay.addWidget(live)
+
+        self.status = W.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        lay.addStretch(1)
+        self._update_test_buttons()
+
+    def _slider(self, form, label, lo, hi, value, unit, on_change):
+        box = QtWidgets.QHBoxLayout()
+        s = QtWidgets.QSlider(Qt.Horizontal)
+        s.setRange(lo, hi)
+        s.setValue(int(value))
+        val = QtWidgets.QLabel()
+        val.setMinimumWidth(110)
+
+        def show(v):
+            val.setText((f"{v:+d}" if lo < 0 else f"{v}") + unit)
+        show(s.value())
+        s.valueChanged.connect(lambda v: (show(v), on_change(v)))
+        box.addWidget(s, 1)
+        box.addWidget(val)
+        form.addRow(label + ":", box)
+        return s
+
+    # ---- voices ----------------------------------------------------------
+    def _model(self, mid=None):
+        mid = mid or self.cfg["mode"]
+        return next((m for m in self.cfg["models"] if m["id"] == mid), None)
+
+    def _fill_voices(self):
+        self.mode.blockSignals(True)
+        self.mode.clear()
+        self.mode.addItem("Normal voice (off)", "off")
+        self.mode.addItem("B1 Battle Droid", "b1")
+        for m in self.cfg["models"]:
+            self.mode.addItem(f"AI: {m['name']}", m["id"])
+        i = self.mode.findData(self.cfg["mode"])
+        if i < 0:
+            self.cfg["mode"] = "off"
+            i = 0
+        self.mode.setCurrentIndex(i)
+        self.mode.blockSignals(False)
+
+    def _mode_chosen(self):
+        self.cfg["mode"] = self.mode.currentData()
+        self.store.save()
+        self._mode_changed()
+
+    def _mode_changed(self):
+        mode = self.cfg["mode"]
+        model = self._model()
+        self.b1_box.setVisible(mode == "b1")
+        self.ai_box.setVisible(model is not None)
+        self.remove_btn.setEnabled(model is not None)
+        self.test_out = None
+        if model:
+            for key, s in self.ai_sliders.items():
+                s.blockSignals(True)
+                s.setValue(int(model.get(key, {"pitch": 12, "index_rate": 75, "protect": 33}[key])))
+                s.blockSignals(False)
+                s.valueChanged.emit(s.value())
+            index = model.get("index") or "none (the voice will be a little less accurate)"
+            self.ai_files.setText(f"Model: {model['pth']}\nIndex: {index}")
+            self._prepare_ai(model)
+        else:
+            self.status.setText("" if mode != "off" else
+                                "Pick a voice. Your mic is not changed while this is off.")
+        self._restart_live()
+        self._update_test_buttons()
+
+    def add_model(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose an RVC voice model", str(Path.home()),
+            "RVC voice models (*.pth *.zip);;All files (*)")
+        if not path:
+            return
+        try:
+            pth, index = self._import_model_files(Path(path))
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            QtWidgets.QMessageBox.warning(self, "Add voice model", str(e))
+            return
+        default = Path(pth).stem.replace("_", " ").strip() or "Voice"
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add voice model", "Name:",
+                                                  text=default)
+        if not ok:
+            return
+        mid = uuid.uuid4().hex[:8]
+        self.cfg["models"].append({"id": mid, "name": name.strip() or default, "pth": pth,
+                                   "index": index, "pitch": 12, "index_rate": 75,
+                                   "protect": 33})
+        self.cfg["mode"] = mid
+        self.store.save()
+        self._fill_voices()
+        self._mode_changed()
+
+    def _import_model_files(self, path):
+        """Returns (pth, index or ""). Zips are unpacked into Blurt's voices folder."""
+        if path.suffix.lower() == ".zip":
+            dest = VOICE_DIR / re.sub(r"[^\w.-]+", "_", path.stem)
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    name = Path(info.filename).name
+                    if info.is_dir() or Path(name).suffix.lower() not in (".pth", ".index"):
+                        continue
+                    with z.open(info) as src, open(dest / name, "wb") as out:
+                        shutil.copyfileobj(src, out)
+            folder = dest
+            pths = sorted(folder.glob("*.pth"), key=lambda p: p.stat().st_size)
+            pths = [p for p in pths if not re.match(r"^[GD]_\d+", p.name)]
+            if not pths:
+                raise ValueError("That zip has no voice model (.pth) in it.")
+            pth = pths[-1]
+        else:
+            pth, folder = path, path.parent
+        if re.match(r"^[GD]_\d+", pth.name):
+            raise ValueError(f"{pth.name} is a training checkpoint, not a voice model. Use "
+                             "the other, smaller .pth that came with it.")
+        indexes = sorted(folder.glob("*.index"))
+        added = [i for i in indexes if i.name.startswith("added")] or indexes
+        index = ""
+        if len(added) == 1:
+            index = str(added[0])
+        elif len(added) > 1:
+            index, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Several .index files - pick the one for this voice", str(folder),
+                "Index files (*.index)")
+        return str(pth), index
+
+    def choose_index(self):
+        model = self._model()
+        if not model:
+            return
+        start = str(Path(model["pth"]).parent)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose the voice's .index file",
+                                                        start, "Index files (*.index)")
+        if path:
+            model["index"] = path
+            self.voices.pop(model["id"], None)
+            self.store.save()
+            self._mode_changed()
+
+    def remove_model(self):
+        model = self._model()
+        if not model:
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Remove voice", f"Remove “{model['name']}” from Blurt? The model "
+                "files themselves are not deleted.") != QtWidgets.QMessageBox.Yes:
+            return
+        self.cfg["models"].remove(model)
+        self.voices.pop(model["id"], None)
+        self.cfg["mode"] = "off"
+        self.store.save()
+        self._fill_voices()
+        self._mode_changed()
+
+    # ---- AI loading ------------------------------------------------------
+    def _ai_ready(self, model):
+        return model is not None and model["id"] in self.voices
+
+    def _prepare_ai(self, model):
+        if not ai_voice_installed():
+            self.status.setText(
+                "AI voices need extra components (PyTorch, about 1 GB). Install them once "
+                "with:\n    bash install.sh --ai-voice\nthen restart Blurt.")
+            return
+        if self._ai_ready(model) or self.loading:
+            if self._ai_ready(model):
+                self.status.setText(f"{model['name']} is ready.")
+            return
+        if not Path(model["pth"]).is_file():
+            self.status.setText(f"The model file is missing: {model['pth']}")
+            return
+        from blurt_voice.rvc import engine
+        missing = engine.assets_missing(AI_ASSETS)
+        if missing:
+            if QtWidgets.QMessageBox.question(
+                    self, "Download voice engine",
+                    "AI voices use two shared helper files (about 560 MB, from Hugging Face). "
+                    "They are downloaded once and kept in Blurt's folder.\n\n"
+                    "Download them now?") != QtWidgets.QMessageBox.Yes:
+                self.status.setText("The voice engine files are needed before AI voices work.")
+                return
+        self.loading = True
+        self._update_test_buttons()
+        self.status.setText(f"Loading {model['name']}…")
+        mid, pth, index = model["id"], model["pth"], model.get("index") or None
+
+        def work(progress):
+            def report(name, done, total):
+                pct = f" {done * 100 // total}%" if total else ""
+                progress(f"Downloading {name}{pct} ({done // 1048576} MB)")
+            engine.download_assets(AI_ASSETS, report)
+            engine.set_threads()
+            if self.helpers is None:
+                progress("Starting the voice engine…")
+                self.helpers = engine.Helpers(AI_ASSETS)
+            progress(f"Loading {model['name']}…")
+            return engine.RVCVoice(self.helpers, pth, index)
+
+        def finished(voice, error):
+            self.loading = False
+            if error:
+                self.status.setText(f"Could not load the voice: {error}")
+            else:
+                self.voices[mid] = voice
+                note = "" if voice.index is not None or not index else \
+                    " (the .index file needs faiss, which is not installed, so it is skipped)"
+                self.status.setText(f"{model['name']} is ready{note}. Record a test to hear it.")
+                if self.cfg["mode"] == mid:
+                    self._restart_live()
+            self._update_test_buttons()
+
+        Background(self, work, finished, self.status.setText)
+
+    def _ai_changed(self, key, value):
+        model = self._model()
+        if not model:
+            return
+        model[key] = value
+        self.store.save()
+        proc = self.live.processor
+        if self.live.running and hasattr(proc, "shift"):
+            proc.shift = model["pitch"]
+            proc.index_rate = model["index_rate"] / 100
+            proc.protect = model["protect"] / 100
+
+    def _resp_changed(self, _i):
+        self.cfg["responsiveness"] = self.resp.currentData()
+        self.store.save()
+        self._restart_live()
+
+    def _b1_changed(self, key, value):
+        self.cfg["b1"][key] = value
+        self.store.save()
+        if isinstance(self.live.processor, B1Droid):
+            self.live.processor.set(**{key: value})
+
+    def _b1_reset(self):
+        for key, s in self.b1_sliders.items():
+            s.setValue(B1_DEFAULTS[key])
+
+    # ---- building processors ---------------------------------------------
+    def _make_processor(self, live):
+        """Returns (processor, block size or 0) for the current voice, or (None, 0)."""
+        mode = self.cfg["mode"]
+        if mode == "b1":
+            b = self.cfg["b1"]
+            return B1Droid(b["pitch"], b["size"], b["metal"]), 0
+        model = self._model()
+        if model and self._ai_ready(model):
+            from blurt_voice.rvc import engine
+            _label, block, context = RESPONSIVENESS[self.cfg["responsiveness"]]
+            stream = engine.RVCStream(self.voices[model["id"]], block_s=block, context_s=context,
+                                      shift=model["pitch"], index_rate=model["index_rate"] / 100,
+                                      protect=model["protect"] / 100)
+            return stream, stream.block
+        return None, 0
+
+    # ---- testing ---------------------------------------------------------
+    def _update_test_buttons(self):
+        mode = self.cfg["mode"]
+        ready = mode == "b1" or self._ai_ready(self._model())
+        self.rec_btn.setEnabled(ready and not getattr(self, "recording", False))
+        self.play_btn.setEnabled(self.test_out is not None)
+        self.orig_btn.setEnabled(self.test_raw is not None)
+        self.redo_btn.setEnabled(ready and self.test_raw is not None)
+        self.save_test_btn.setEnabled(self.test_out is not None)
+
+    def record_test(self):
+        source = self.store.settings.get("mic", "")
+        if not source:
+            self.status.setText("Pick your microphone under “Input” in the main window first.")
+            return
+        self.recording = True
+        self._update_test_buttons()
+        self.player.stop()
+        self._countdown = TEST_SECONDS
+        self.status.setText(f"Recording… speak now ({self._countdown} s)")
+        tick = QtCore.QTimer(self)
+
+        def step():
+            self._countdown -= 1
+            if self._countdown > 0 and getattr(self, "recording", False):
+                self.status.setText(f"Recording… speak now ({self._countdown} s)")
+            else:
+                tick.stop()
+        tick.timeout.connect(step)
+        tick.start(1000)
+
+        def work(_progress):
+            proc = subprocess.Popen(
+                ["parec", f"--device={source}", "--format=float32le", f"--rate={VOICE_RATE}",
+                 "--channels=1", "--latency-msec=20", "--raw",
+                 "--client-name=Blurt voice test"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            want = TEST_SECONDS * VOICE_RATE * 4
+            data = b""
+            try:
+                while len(data) < want:
+                    chunk = proc.stdout.read(min(65536, want - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                proc.terminate()
+            return np.frombuffer(data[:len(data) // 4 * 4], dtype="<f4").astype(np.float32)
+
+        def finished(audio, error):
+            self.recording = False
+            tick.stop()
+            if error or audio is None or len(audio) < VOICE_RATE // 2:
+                self.status.setText(f"Recording failed: {error or 'no audio from the mic'}")
+                self._update_test_buttons()
+                return
+            self.test_raw = audio
+            if float(np.abs(audio).max()) < 0.01:
+                self.status.setText("That was nearly silent - check the Input microphone in "
+                                    "the main window.")
+            self._convert_test()
+        Background(self, work, finished)
+
+    def _convert_test(self):
+        if self.test_raw is None:
+            return
+        processor, _block = self._make_processor(live=False)
+        model = self._model()
+        if self.cfg["mode"] == "b1":
+            b1 = processor
+            pad = np.zeros(b1.latency + 4800, np.float32)
+            src = np.concatenate([self.test_raw, pad])
+            out = np.concatenate([b1.process(src[i:i + 480]) for i in range(0, len(src), 480)])
+            self.test_out = out[b1.latency:b1.latency + len(self.test_raw)]
+            self.status.setText("Done. Press “Play with voice”.")
+            self._update_test_buttons()
+            self._play_test(self.test_out)
+            return
+        if not self._ai_ready(model):
+            return
+        voice = self.voices[model["id"]]
+        raw = self.test_raw
+        settings = (model["pitch"], model["index_rate"] / 100, model["protect"] / 100)
+        self.status.setText(f"Converting with {model['name']}… (this takes a few seconds)")
+        self.rec_btn.setEnabled(False)
+        self.redo_btn.setEnabled(False)
+        started = time.perf_counter()
+
+        def work(_progress):
+            y, sr = voice.convert(raw, VOICE_RATE, *settings)
+            from blurt_voice.rvc.engine import resample
+            return resample(y, sr, VOICE_RATE)
+
+        def finished(out, error):
+            if error:
+                self.status.setText(f"Conversion failed: {error}")
+            else:
+                self.test_out = out
+                took = time.perf_counter() - started
+                self.status.setText(f"Done in {took:.1f} s. Playing it now.")
+                self._play_test(out)
+            self._update_test_buttons()
+        Background(self, work, finished)
+
+    def _play_test(self, audio):
+        if audio is None:
+            return
+        CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+        path = CLIPS_DIR / f"voice-test-{uuid.uuid4().hex[:6]}.wav"
+        write_wav(to_wav_pcm(audio, VOICE_RATE), path)
+        old = getattr(self, "_test_file", None)
+        self._test_file = path
+        self.player.stop()
+        self.player_out.setDevice(self.win.engine.out_me.device())
+        self.player_out.setVolume(max(0.3, self.win.engine.out_me.volume()))
+        self.player.setSource(QtCore.QUrl.fromLocalFile(str(path)))
+        self.player.play()
+        if old:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def save_test(self):
+        if self.test_out is None:
+            return
+        label = self.mode.currentText().replace("AI: ", "")
+        target = self.win._ask_save("Save voice test", f"{label} test", "Voice tests")
+        if target:
+            self.win._add_sound(*target, pcm=to_wav_pcm(self.test_out, VOICE_RATE))
+
+    # ---- live --------------------------------------------------------------
+    def wants_mic(self):
+        """True when Blurt-Mic should carry the changed voice instead of the raw mic."""
+        return self.on_mic.isChecked() and self.live.running
+
+    def _live_changed(self, *_):
+        self._restart_live()
+
+    def _restart_live(self):
+        self.live.stop()
+        want = self.on_mic.isChecked() or self.monitor.isChecked()
+        source = self.store.settings.get("mic", "")
+        processor, block = self._make_processor(live=True) if want else (None, 0)
+        if want and not source:
+            self.live_status.setText("Pick your microphone under “Input” in the main window.")
+        elif want and processor is None:
+            self.live_status.setText("Live voice starts once the voice is ready." if
+                                     self.cfg["mode"] != "off" else
+                                     "Pick a voice above to use it live.")
+        if processor is not None and source:
+            self.live.set_output("mic", MIX_SINK if self.on_mic.isChecked() else None)
+            out = device_id(self.win.engine.out_me.device()) or "@DEFAULT_SINK@"
+            self.live.set_output("monitor", out if self.monitor.isChecked() else None)
+            self.live.start(source, processor, block)
+        else:
+            self.live.set_output("mic", None)
+            self.live.set_output("monitor", None)
+        self.win.apply_mic_routing()
+        self.win.voice_btn.setText("🎙 Voice (on)" if self.wants_mic() else "🎙 Voice…")
+
+    def _update_live_status(self):
+        if not self.live.running:
+            if self.on_mic.isChecked() or self.monitor.isChecked():
+                return
+            self.live_status.setText("Live voice is off. Others hear your normal mic.")
+            return
+        proc = self.live.processor
+        own = proc.latency() if callable(getattr(proc, "latency", None)) else \
+            getattr(proc, "latency", 0) / VOICE_RATE
+        delay = 0.04 + own
+        where = []
+        if self.on_mic.isChecked():
+            where.append("others hear it")
+        if self.monitor.isChecked():
+            where.append("you hear it")
+        text = (f"Live ({' and '.join(where)}): about {delay:.2f} s delay, processing uses "
+                f"{self.live.cost * 100:.0f}% of real time.")
+        if self.live.cost > 0.9 or self.live.dropped:
+            text += (" Your computer is struggling to keep up, so bits get skipped. Try "
+                     "“Smooth” responsiveness.")
+        self.live_status.setText(text)
+
+    def toggle_on_mic(self):
+        self.on_mic.setChecked(not self.on_mic.isChecked())
+
+    def shutdown(self):
+        self.live.close()
+
+    def closeEvent(self, ev):
+        self.player.stop()
+        super().closeEvent(ev)
+
+
 ACTIONS = {"stop": "Stop", "pause": "Pause / resume", "random": "Play random sound",
            "clip": "Clip what just played", "replay_clip": "Replay last clip",
-           "save_clip": "Save last clip to library"}
+           "save_clip": "Save last clip to library",
+           "voice": "Voice changer on/off (for others)"}
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1656,6 +2415,14 @@ class MainWindow(QtWidgets.QMainWindow):
             b = W.QPushButton(text)
             b.clicked.connect(slot)
             top.addWidget(b)
+        self.voice_btn = W.QPushButton("🎙 Voice…")
+        self.voice_btn.setToolTip("Voice changer: B1 Battle Droid and AI voices on your mic")
+        self.voice_btn.clicked.connect(self.open_voice)
+        if B1Droid is None or np is None:
+            self.voice_btn.setEnabled(False)
+            self.voice_btn.setToolTip("The voice changer needs numpy and the blurt_voice folder "
+                                      "- run install.sh again.")
+        top.addWidget(self.voice_btn)
         self.hk_btn = W.QPushButton("Control hotkeys")
         self.hk_menu = W.QMenu(self)
         self.hk_menu.aboutToShow.connect(self._fill_hk_menu)
@@ -1787,7 +2554,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mic_combo.addItem(desc, name)
         idx = max(0, self.mic_combo.findData(saved))
         self.mic_combo.setCurrentIndex(idx)
-        self.router.set_mic(self.mic_combo.currentData())
+        self.apply_mic_routing()
         self.clip_combo.clear()
         self.clip_combo.addItem("What I hear (the selected output)", "")
         for i in range(1, self.mic_combo.count()):
@@ -1799,7 +2566,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mic_chosen(self, _i):
         self.store.settings["mic"] = self.mic_combo.currentData()
         self.store.save()
-        self.router.set_mic(self.mic_combo.currentData())
+        if getattr(self, "voice_dlg", None):
+            self.voice_dlg._restart_live()  # also re-applies the mic routing
+        else:
+            self.apply_mic_routing()
+
+    def apply_mic_routing(self):
+        """Blurt-Mic carries the raw mic, unless the voice changer is feeding it instead."""
+        dlg = getattr(self, "voice_dlg", None)
+        mic = self.store.settings.get("mic", "")
+        self.router.set_mic(None if dlg and dlg.wants_mic() else mic)
+
+    def open_voice(self):
+        if not getattr(self, "voice_dlg", None):
+            self.voice_dlg = VoiceDialog(self)
+        self.voice_dlg.show()
+        self.voice_dlg.raise_()
+        self.voice_dlg.activateWindow()
+
+    def toggle_voice(self):
+        if B1Droid is None or np is None:
+            return
+        if not getattr(self, "voice_dlg", None):
+            self.voice_dlg = VoiceDialog(self)
+        self.voice_dlg.toggle_on_mic()
+        self.statusBar().showMessage(
+            "Voice changer on" if self.voice_dlg.on_mic.isChecked() else "Voice changer off",
+            3000)
+
+    def shutdown_voice(self):
+        if getattr(self, "voice_dlg", None):
+            self.voice_dlg.shutdown()
 
     def refresh_outputs(self):
         saved = self.store.settings.get("output", "")
@@ -1833,6 +2630,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store.settings["output"] = self.out_combo.currentData()
         self.store.save()
         self._apply_output()
+        if getattr(self, "voice_dlg", None):
+            self.voice_dlg._restart_live()  # "hear myself" follows the output
 
     # ---- folders ---------------------------------------------------------
     def current_folder(self):
@@ -2300,7 +3099,8 @@ class MainWindow(QtWidgets.QMainWindow):
         elif kind == "action":
             {"stop": self.engine.stop, "pause": self.engine.toggle_pause,
              "random": self.play_random, "clip": self.clip,
-             "replay_clip": self.replay_clip, "save_clip": self.save_clip_quick}[target]()
+             "replay_clip": self.replay_clip, "save_clip": self.save_clip_quick,
+             "voice": self.toggle_voice}[target]()
 
     def eventFilter(self, obj, ev):
         # Fallback when /dev/input is not readable: hotkeys while the window has focus.
@@ -2332,6 +3132,7 @@ def main():
     app.aboutToQuit.connect(store.save)
     app.aboutToQuit.connect(win.clipper.stop)
     app.aboutToQuit.connect(win.tee.stop)
+    app.aboutToQuit.connect(win.shutdown_voice)
     atexit.register(win.tee.stop)
     app.aboutToQuit.connect(router.teardown)
     signal.signal(signal.SIGINT, lambda *_: app.quit())

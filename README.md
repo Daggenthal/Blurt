@@ -18,6 +18,7 @@ While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick t
 - **Clipping:** Blurt keeps a rolling buffer of what plays on your output. Press a hotkey to clip the last 0.2 to 30 seconds, replay it through the mic, edit it, or save it to your library. Blurt's own playback is left out of the clip.
 - **Editor:** a waveform view where you select, trim, cut, zoom and undo, with a preview that only you hear.
 - **Effects:** noise reduction, click removal, noise gate, amplify, normalize, fades, reverse, silence, repeat, speed, pitch, echo, reverb, bass boost, distortion, telephone and robot. Each one can be previewed before it is applied.
+- **Voice changer:** change your live mic voice. Includes a B1 Battle Droid voice, and AI voices from any RVC model you download (for example Miku or Teto). Record a 5 second test to hear the result privately before anyone else hears it, or turn on "Hear myself live".
 - **Real files:** your library is stored as normal files in `~/.local/share/blurt/sounds/`, in folders that match the ones in the app.
 
 ![Editor](screenshots/editor.png)
@@ -28,6 +29,7 @@ While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick t
 - Python 3 with `venv`
 - `pactl` and `parec` (part of `libpulse` or `pulseaudio-utils`)
 - `pw-dump` and `pw-link` (part of PipeWire) to keep Blurt's own playback out of clips
+- For AI voices only: about 1 GB for PyTorch, plus a one time 560 MB download of two helper files. A recent multi-core CPU is needed for live AI voices.
 
 SteamOS already ships all of these.
 
@@ -40,6 +42,12 @@ bash install.sh
 ```
 
 The installer needs no root. It puts everything in your home folder: a Python environment with PySide6 and numpy in `~/.local/share/blurt/`, a launcher in `~/.local/bin/blurt`, and a menu entry.
+
+To also enable AI voices, run the installer with `--ai-voice` instead:
+
+```bash
+bash install.sh --ai-voice
+```
 
 For hotkeys that work while another window is focused, add yourself to the `input` group once, then log out and back in:
 
@@ -64,6 +72,17 @@ Then:
 1. Select **Blurt-Mic** as the microphone in Discord or your game.
 2. In Blurt, pick your real microphone under Input and your headphones or speakers under Output.
 3. Import some sounds, right-click one and choose **Set hotkey**.
+
+## Voice changer
+
+Click **Voice** in the main window.
+
+- **B1 Battle Droid** works right away. Pitch, size and metal can be adjusted.
+- **AI voices** use RVC voice models (a `.pth` file, ideally with its `.index` file). Click **Add AI voice model**, then pick the `.pth` or the `.zip` it came in. Blurt does not include any models.
+- **Test first:** press **Record 5 s test**, speak, and Blurt plays the result back only to you.
+- **Go live:** tick **Others hear this voice** to send it to Blurt-Mic. A hotkey can toggle it.
+
+AI voices run on the CPU. Live AI voices have roughly half a second to a second of delay, depending on your CPU and the responsiveness setting. Blurt loads `.pth` files in PyTorch's safe mode, which refuses files that contain code.
 
 ## Tested on
 
