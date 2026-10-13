@@ -1886,8 +1886,12 @@ class VoiceDialog(QtWidgets.QDialog):
         add.clicked.connect(self.add_model)
         self.remove_btn = W.QPushButton("Remove")
         self.remove_btn.clicked.connect(self.remove_model)
+        manage = W.QPushButton("Manage voices…")
+        manage.setToolTip("Remove several voices at once, or bring back the built-in ones")
+        manage.clicked.connect(self.manage_voices)
         row.addWidget(find)
         row.addWidget(add)
+        row.addWidget(manage)
         row.addWidget(self.remove_btn)
         lay.addLayout(row)
 
@@ -2044,7 +2048,8 @@ class VoiceDialog(QtWidgets.QDialog):
         self.mode.blockSignals(True)
         self.mode.clear()
         self.mode.addItem("Normal voice (off)", "off")
-        self.mode.addItem("B1 Battle Droid", "b1")
+        if not self.cfg.get("hide_b1"):
+            self.mode.addItem("B1 Battle Droid", "b1")
         for m in self.cfg["models"]:
             self.mode.addItem(f"AI: {m['name']}", m["id"])
         i = self.mode.findData(self.cfg["mode"])
@@ -2064,7 +2069,7 @@ class VoiceDialog(QtWidgets.QDialog):
         model = self._model()
         self.b1_box.setVisible(mode == "b1")
         self.ai_box.setVisible(model is not None)
-        self.remove_btn.setEnabled(model is not None)
+        self.remove_btn.setEnabled(model is not None or mode == "b1")
         self.test_out = None
         if model:
             self._setting_auto = True  # loading saved values is not a manual change
@@ -2319,6 +2324,13 @@ class VoiceDialog(QtWidgets.QDialog):
             self._mode_changed()
 
     def remove_model(self):
+        mode = self.cfg["mode"]
+        if mode == "b1":
+            if QtWidgets.QMessageBox.question(
+                    self, "Remove voice", "Hide the B1 Battle Droid voice? You can bring it "
+                    "back from “Manage voices…”.") == QtWidgets.QMessageBox.Yes:
+                self.remove_voices(["b1"])
+            return
         model = self._model()
         if not model:
             return
@@ -2326,12 +2338,119 @@ class VoiceDialog(QtWidgets.QDialog):
                 self, "Remove voice", f"Remove “{model['name']}” from Blurt? The model "
                 "files themselves are not deleted.") != QtWidgets.QMessageBox.Yes:
             return
-        self.cfg["models"].remove(model)
-        self.voices.pop(model["id"], None)
-        self.cfg["mode"] = "off"
+        self.remove_voices([model["id"]])
+
+    def remove_voices(self, ids, delete_files=False):
+        """Remove voices from the list. Files are only ever deleted inside Blurt's own
+        voices folder (where online downloads and unpacked zips go)."""
+        deleted = 0
+        for vid in ids:
+            if vid == "b1":
+                self.cfg["hide_b1"] = True
+                continue
+            model = self._model(vid)
+            if not model:
+                continue
+            self.cfg["models"].remove(model)
+            self.voices.pop(vid, None)
+            if delete_files:
+                deleted += self._delete_model_files(model)
+        if self.cfg["mode"] in ids:
+            self.cfg["mode"] = "off"
         self.store.save()
         self._fill_voices()
         self._mode_changed()
+        return deleted
+
+    def _delete_model_files(self, model):
+        root = VOICE_DIR.resolve()
+        count = 0
+        for key in ("pth", "index"):
+            path = model.get(key)
+            if not path:
+                continue
+            path = Path(path).resolve()
+            if root not in path.parents:
+                continue  # the user's own file somewhere else: never touch it
+            for f in (path, Path(str(path) + ".blurt.json"),
+                      Path(str(path) + ".blurt-fast.index")):
+                try:
+                    f.unlink()
+                    count += 1
+                except OSError:
+                    pass
+            folder = path.parent
+            while folder != root and root in folder.parents:
+                try:
+                    folder.rmdir()  # only when empty
+                except OSError:
+                    break
+                folder = folder.parent
+        return count
+
+    def manage_voices(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Manage voices")
+        dlg.resize(460, 380)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel("Tick the voices to remove:"))
+        lst = QtWidgets.QListWidget()
+        entries = []
+        if not self.cfg.get("hide_b1"):
+            entries.append(("b1", "B1 Battle Droid (built in)", False))
+        for m in self.cfg["models"]:
+            mine = VOICE_DIR.resolve() in Path(m["pth"]).resolve().parents
+            entries.append((m["id"], f"{m['name']}" + ("  (downloaded)" if mine else
+                                                       f"  ({Path(m['pth']).parent})"), mine))
+        for vid, label, _mine in entries:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(Qt.UserRole, vid)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            lst.addItem(item)
+        lay.addWidget(lst, 1)
+        delete = QtWidgets.QCheckBox("Also delete the downloaded model files")
+        delete.setToolTip("Only files Blurt downloaded or unpacked into its own voices folder "
+                          "are deleted. Your own files elsewhere are never touched.")
+        lay.addWidget(delete)
+        row = QtWidgets.QHBoxLayout()
+        select_all = QtWidgets.QPushButton("Select all")
+        select_all.clicked.connect(lambda: [lst.item(i).setCheckState(Qt.Checked)
+                                            for i in range(lst.count())])
+        row.addWidget(select_all)
+        if self.cfg.get("hide_b1"):
+            back = QtWidgets.QPushButton("Bring back B1 Battle Droid")
+
+            def restore():
+                self.cfg["hide_b1"] = False
+                self.store.save()
+                self._fill_voices()
+                back.setEnabled(False)
+            back.clicked.connect(restore)
+            row.addWidget(back)
+        row.addStretch(1)
+        remove = QtWidgets.QPushButton("Remove ticked")
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(dlg.reject)
+        row.addWidget(remove)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+        def do_remove():
+            ids = [lst.item(i).data(Qt.UserRole) for i in range(lst.count())
+                   if lst.item(i).checkState() == Qt.Checked]
+            if not ids:
+                return
+            what = f"{len(ids)} voice" + ("s" if len(ids) != 1 else "")
+            extra = " and delete their downloaded files" if delete.isChecked() else ""
+            if QtWidgets.QMessageBox.question(dlg, "Remove voices",
+                                              f"Remove {what}{extra}?") != QtWidgets.QMessageBox.Yes:
+                return
+            n = self.remove_voices(ids, delete.isChecked())
+            self.status.setText(f"Removed {what}" + (f", deleted {n} files." if n else "."))
+            dlg.accept()
+        remove.clicked.connect(do_remove)
+        dlg.exec()
 
     # ---- AI loading ------------------------------------------------------
     def _ai_ready(self, model):
