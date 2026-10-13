@@ -1887,6 +1887,21 @@ class VoiceDialog(QtWidgets.QDialog):
         idx_btn = W.QPushButton("Choose .index file…")
         idx_btn.clicked.connect(self.choose_index)
         form.addRow("", idx_btn)
+        prow = W.QHBoxLayout()
+        self.preset = W.QComboBox()
+        self.preset.setMinimumWidth(200)
+        self.preset.activated.connect(self._preset_chosen)
+        save_p = W.QPushButton("Save settings as…")
+        save_p.setToolTip("Keep these settings under a name, e.g. “talking” and “singing”")
+        save_p.clicked.connect(self.save_preset)
+        self.del_preset = W.QPushButton("Delete")
+        self.del_preset.clicked.connect(self.delete_preset)
+        prow.addWidget(self.preset, 1)
+        prow.addWidget(save_p)
+        prow.addWidget(self.del_preset)
+        form.addRow("Saved settings:", prow)
+        self.saved_note = W.QLabel("<small>Changes are saved for this voice automatically.</small>")
+        form.addRow("", self.saved_note)
         self.vtype = W.QComboBox()
         for key, (label, _f) in VOICE_TYPES.items():
             self.vtype.addItem(label, key)
@@ -2028,6 +2043,7 @@ class VoiceDialog(QtWidgets.QDialog):
             self.auto_box.setChecked(model.get("auto", False))
             self._setting_auto = False
             self._apply_auto_pitch(model)
+            self._fill_presets(model)
             index = model.get("index") or "none (the voice will be a little less accurate)"
             self.ai_files.setText(f"Model: {model['pth']}\nIndex: {index}")
             self._prepare_ai(model)
@@ -2075,12 +2091,20 @@ class VoiceDialog(QtWidgets.QDialog):
                 return None
             name = name_edit.text().strip() or default_name
             vtype = types.currentData()
+        side = self._read_sidecar(pth)
+        if side and not ask:
+            name = side.get("name") or name
         mid = uuid.uuid4().hex[:8]
         model = {"id": mid, "name": name, "pth": str(pth), "index": index or "",
                  "voice_type": vtype, "auto": True,
                  "pitch": auto_pitch(vtype, self.cfg.get("my_pitch")) if self.cfg.get("my_pitch")
                  else (12 if vtype == "high" else 0),
                  "index_rate": 75, "protect": 33}
+        if side:  # settings saved earlier for this exact model file
+            model["presets"] = side.get("presets", {})
+            model["preset"] = side.get("preset", "") if side.get("preset") in model["presets"] else ""
+            current = model["presets"].get(model["preset"]) or side.get("current") or {}
+            model.update({k: v for k, v in current.items() if k in self.PRESET_KEYS and v is not None})
         self.cfg["models"].append(model)
         self.cfg["mode"] = mid
         self.store.save()
@@ -2093,6 +2117,84 @@ class VoiceDialog(QtWidgets.QDialog):
         self.search_dlg = dlg
         dlg.show()
         dlg.raise_()
+
+    # ---- saved settings (presets) ----------------------------------------------
+    PRESET_KEYS = ("pitch", "index_rate", "protect", "voice_type", "auto")
+
+    def _fill_presets(self, model):
+        self.preset.blockSignals(True)
+        self.preset.clear()
+        self.preset.addItem("Current settings", "")
+        for name in sorted(model.get("presets", {}), key=str.lower):
+            self.preset.addItem(name, name)
+        self.preset.setCurrentIndex(max(0, self.preset.findData(model.get("preset", ""))))
+        self.preset.blockSignals(False)
+        self.del_preset.setEnabled(bool(self.preset.currentData()))
+
+    def save_preset(self):
+        model = self._model()
+        if not model:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save settings", f"Name for these {model['name']} settings:",
+            text=model.get("preset") or "My settings")
+        name = name.strip()
+        if not ok or not name:
+            return
+        model.setdefault("presets", {})[name] = {k: model.get(k) for k in self.PRESET_KEYS}
+        model["preset"] = name
+        self.store.save()
+        self._fill_presets(model)
+        backup = self._write_sidecar(model)
+        self.saved_note.setText(f"<small>Saved as “{name}”." + (
+            " A backup copy is kept next to the model file, so the settings come back even "
+            "if you remove and re-add the voice." if backup else "") + "</small>")
+
+    @staticmethod
+    def _sidecar(pth):
+        return Path(str(pth) + ".blurt.json")
+
+    def _write_sidecar(self, model):
+        """Keep saved settings next to the model file too, so they survive a lost library."""
+        data = {"name": model["name"], "presets": model.get("presets", {}),
+                "preset": model.get("preset", ""),
+                "current": {k: model.get(k) for k in self.PRESET_KEYS}}
+        try:
+            self._sidecar(model["pth"]).write_text(json.dumps(data, indent=1))
+            return True
+        except OSError:
+            return False
+
+    def _read_sidecar(self, pth):
+        try:
+            return json.loads(self._sidecar(pth).read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _preset_chosen(self, _i):
+        model = self._model()
+        name = self.preset.currentData()
+        if not model:
+            return
+        model["preset"] = name
+        if name:
+            model.update({k: v for k, v in model["presets"][name].items() if v is not None})
+        self.store.save()
+        self._mode_changed()  # shows the loaded values and applies them live
+        if name:
+            self.saved_note.setText(f"<small>Using “{name}”.</small>")
+
+    def delete_preset(self):
+        model = self._model()
+        name = self.preset.currentData()
+        if not model or not name:
+            return
+        model.get("presets", {}).pop(name, None)
+        model["preset"] = ""
+        self.store.save()
+        self._fill_presets(model)
+        self._write_sidecar(model)
+        self.saved_note.setText(f"<small>Deleted “{name}”.</small>")
 
     # ---- automatic settings --------------------------------------------------
     def _vtype_changed(self, _i):
@@ -2272,6 +2374,11 @@ class VoiceDialog(QtWidgets.QDialog):
         if not model:
             return
         model[key] = value
+        if not self._setting_auto and model.get("preset"):
+            saved = model.get("presets", {}).get(model["preset"], {})
+            if saved.get(key) != value:
+                self.saved_note.setText(f"<small>Changed from “{model['preset']}”. Use "
+                                        "“Save settings as…” to update it.</small>")
         if key == "pitch" and not self._setting_auto and model.get("auto"):
             model["auto"] = False
             self._setting_auto = True
@@ -2551,6 +2658,17 @@ class VoiceDialog(QtWidgets.QDialog):
         super().closeEvent(ev)
 
 
+class SortItem(QtWidgets.QTreeWidgetItem):
+    """Sorts by the value stored in each column's UserRole (numbers sort as numbers)."""
+
+    def __lt__(self, other):
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        a, b = self.data(col, Qt.UserRole), other.data(col, Qt.UserRole)
+        if a is None or b is None:
+            return self.text(col).lower() < other.text(col).lower()
+        return a < b
+
+
 class VoiceSearchDialog(QtWidgets.QDialog):
     """Search Hugging Face for RVC voices; download one and add it straight to Blurt."""
 
@@ -2571,12 +2689,25 @@ class VoiceSearchDialog(QtWidgets.QDialog):
         row.addWidget(self.query, 1)
         row.addWidget(self.go)
         lay.addLayout(row)
+        frow = W.QHBoxLayout()
+        self.filter = W.QLineEdit()
+        self.filter.setPlaceholderText("Filter results…")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self._apply_filter)
+        self.with_index = W.QCheckBox("Only voices with an index file")
+        self.with_index.toggled.connect(self._apply_filter)
+        frow.addWidget(self.filter, 1)
+        frow.addWidget(self.with_index)
+        frow.addWidget(W.QLabel("<small>Click a column title to sort.</small>"))
+        lay.addLayout(frow)
         self.table = W.QTreeWidget()
-        self.table.setColumnCount(4)
-        self.table.setHeaderLabels(["Voice", "Files", "Size", "From"])
+        self.table.setColumnCount(6)
+        self.table.setHeaderLabels(["Voice", "Files", "Size", "Downloads", "Likes", "From"])
         self.table.setRootIsDecorated(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
         self.table.header().setSectionResizeMode(0, W.QHeaderView.Stretch)
+        self.table.header().setSortIndicatorShown(True)
         self.table.itemDoubleClicked.connect(lambda *_: self.download())
         lay.addWidget(self.table, 1)
         row = W.QHBoxLayout()
@@ -2622,15 +2753,29 @@ class VoiceSearchDialog(QtWidgets.QDialog):
                 self.status.setText(f"Search failed: {error}")
                 return
             self.results = results
-            for e in results:
+            self.table.setSortingEnabled(False)
+            for i, e in enumerate(results):
                 files = "model + index" if e["index"] else (
                     "zip pack" if e["kind"] == "zip" else "model only")
-                size = self._mb(e["size"] + e.get("index_size", 0))
+                total = e["size"] + e.get("index_size", 0)
                 where = e["repo"] + (f"  ({Path(e['path']).parent})"
                                      if str(Path(e["path"]).parent) not in (".", "") else "")
-                item = QtWidgets.QTreeWidgetItem([e["name"], files, size, where])
+                item = SortItem([e["name"], files, self._mb(total), f"{e.get('downloads', 0):,}",
+                                 f"{e.get('likes', 0):,}", where])
+                item.setData(0, Qt.UserRole + 1, i)  # position in self.results
+                item.setData(0, Qt.UserRole, e["name"].lower())
+                item.setData(1, Qt.UserRole, {"model + index": 0, "zip pack": 1}.get(files, 2))
+                item.setData(2, Qt.UserRole, total)
+                item.setData(3, Qt.UserRole, -int(e.get("downloads", 0)))  # most first
+                item.setData(4, Qt.UserRole, -int(e.get("likes", 0)))
+                item.setData(5, Qt.UserRole, where.lower())
+                for col in (2, 3, 4):
+                    item.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
                 item.setToolTip(0, e["path"])
                 self.table.addTopLevelItem(item)
+            self.table.setSortingEnabled(True)
+            self.table.header().setSortIndicator(-1, Qt.AscendingOrder)  # keep relevance order
+            self._apply_filter()
             if results:
                 self.table.setCurrentItem(self.table.topLevelItem(0))
                 self.status.setText(f"Found {len(results)} voices. “model + index” usually "
@@ -2640,11 +2785,21 @@ class VoiceSearchDialog(QtWidgets.QDialog):
                                     "a Hugging Face page that has the model.")
         Background(self, lambda progress: hub.search(text, progress), done, self.status.setText)
 
+    def _apply_filter(self, *_):
+        words = self.filter.text().lower().split()
+        need_index = self.with_index.isChecked()
+        for i in range(self.table.topLevelItemCount()):
+            item = self.table.topLevelItem(i)
+            e = self.results[item.data(0, Qt.UserRole + 1)]
+            text = " ".join([e["name"], e["repo"], e["path"]]).lower()
+            hide = any(w not in text for w in words) or (need_index and not e["index"])
+            item.setHidden(hide)
+
     def _selected(self):
         item = self.table.currentItem()
-        if not item:
+        if not item or item.isHidden():
             return None
-        return self.results[self.table.indexOfTopLevelItem(item)]
+        return self.results[item.data(0, Qt.UserRole + 1)]
 
     def open_page(self):
         e = self._selected()
