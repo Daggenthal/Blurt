@@ -168,3 +168,51 @@ class B1Droid:
 
 
 PRESETS = {"b1": ("B1 Battle Droid", B1Droid)}
+
+
+class NoiseGate:
+    """Mutes the mic between words: breaths, typing, fans, room noise.
+
+    The gate opens when the level stays above the threshold for at least `min_ms` (so a
+    single key click does not open it), stays open for `hold_ms` after you stop, and fades
+    instead of cutting. A short look-ahead delay means the start of each word is not lost.
+    Works on any chunk size; 10 ms chunks are typical.
+    """
+
+    def __init__(self, threshold_db=-45.0, hold_ms=200, min_ms=25, lookahead_ms=20,
+                 floor_db=-60.0):
+        self.threshold_db = threshold_db
+        self.hold = int(hold_ms * RATE / 1000)
+        self.min_len = int(min_ms * RATE / 1000)
+        self.delay = np.zeros(int(lookahead_ms * RATE / 1000), np.float32)
+        self.floor = 10 ** (floor_db / 20)
+        self.gain = self.floor
+        self.above = 0          # how long the level has been over the threshold
+        self.open_left = 0      # samples of hold remaining
+        self.level_db = -120.0  # for a level meter
+        self.is_open = False
+        self.latency = len(self.delay)
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        n = len(x)
+        rms = float(np.sqrt(np.mean(x ** 2))) if n else 0.0
+        self.level_db = 20 * np.log10(rms + 1e-9)
+        if self.level_db > self.threshold_db:
+            self.above += n
+        else:
+            self.above = 0
+        if self.above >= self.min_len:
+            self.open_left = self.hold
+        else:
+            self.open_left = max(0, self.open_left - n)
+        self.is_open = self.open_left > 0
+        target = 1.0 if self.is_open else self.floor
+        # quick fade in (about 5 ms), slower fade out (about 80 ms) so words don't get clipped
+        speed = 1 - np.exp(-n / (RATE * (0.005 if target > self.gain else 0.06)))
+        end = self.gain + (target - self.gain) * speed
+        ramp = np.linspace(self.gain, end, n, dtype=np.float32) if n else np.zeros(0, np.float32)
+        self.gain = float(end)
+        data = np.concatenate([self.delay, x])
+        out, self.delay = data[:n], data[n:]
+        return out * ramp

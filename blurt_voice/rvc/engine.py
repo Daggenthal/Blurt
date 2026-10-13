@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import urllib.request
+from collections import deque
 from math import gcd
 from pathlib import Path
 
@@ -249,8 +250,17 @@ class RVCVoice:
         with torch.inference_mode():
             return self._infer_inner(audio16, shift, index_rate, protect, keep, f0)
 
+    def _sync(self):
+        if self.device == "cuda":
+            torch.cuda.synchronize()  # so GPU timings are real, not just queued work
+
     def _infer_inner(self, audio16, shift, index_rate, protect, keep, f0):
+        times = self.times = {}
+        t = time.perf_counter()
         feats = self.helpers.features(audio16, self.version)
+        self._sync()
+        times["features"] = time.perf_counter() - t
+        t = time.perf_counter()
         use_protect = protect < 0.5 and self.if_f0
         if use_protect:
             feats0 = feats.clone()
@@ -263,6 +273,7 @@ class RVCVoice:
             feats = torch.from_numpy(npy.astype(np.float32)).unsqueeze(0).to(self.device) \
                 * index_rate \
                 + (1 - index_rate) * feats
+        times["index"] = time.perf_counter() - t
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         if use_protect:
             feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
@@ -273,7 +284,9 @@ class RVCVoice:
         lengths = torch.LongTensor([p_len]).to(dev)
         with torch.no_grad(), self.helpers.maths():
             if self.if_f0:
+                t = time.perf_counter()
                 coarse, f0 = self._f0(audio16, shift, f0)
+                times["pitch"] = time.perf_counter() - t
                 pitch = torch.from_numpy(coarse[:p_len]).unsqueeze(0).to(dev)
                 pitchf = torch.from_numpy(f0[:p_len]).unsqueeze(0).to(dev)
                 if pitch.shape[1] < p_len:  # pitch track can be a frame short
@@ -286,9 +299,13 @@ class RVCVoice:
                     mask[pitchf < 1] = protect
                     mask = mask.unsqueeze(-1)
                     feats = feats * mask + feats0[:, :p_len] * (1 - mask)
+                t = time.perf_counter()
                 out = self.net.infer(feats, lengths, pitch, pitchf, sid, rate=keep)[0]
             else:
+                t = time.perf_counter()
                 out = self.net.infer(feats, lengths, sid, rate=keep)[0]
+            self._sync()
+            times["synthesis"] = time.perf_counter() - t
         return out[0, 0].float().cpu().numpy()
 
     # ---- whole recordings ------------------------------------------------
@@ -352,6 +369,8 @@ class RVCStream:
         self.fade_in, self.fade_out = fade, 1 - fade
         self.last_cost = 0.0
         self.lock = threading.Lock()
+        self.stats = {}   # step name -> recent timings in seconds (for the performance window)
+        self.silent_blocks = 0
         self.level = 0.0  # running loudness of speech, for automatic input gain
         self.hold = 0     # blocks to keep converting after speech goes quiet
 
@@ -379,17 +398,24 @@ class RVCStream:
             out[:self.cross] = self.prev * self.fade_out
             self.prev[:] = 0
             self.last_cost = time.perf_counter() - t0
+            self.silent_blocks += 1
             return out
         audio16 = signal.lfilter(*_HIGHPASS, self.buf16).astype(np.float32)
         keep = (self.tail16 + WINDOW * 2) / len(audio16)
+        prep = time.perf_counter() - t0
+        pitch_t = 0.0
         with self.lock:
             if self.voice.if_f0:
+                t = time.perf_counter()
                 seg = audio16[-(n + self.f0_ctx16):]
                 with torch.inference_mode():
                     f0 = self.voice.helpers.rmvpe.infer_from_audio(seg, thred=0.03)
                 self.f0_cache[-(frames + 1):] = f0[-(frames + 1):]
+                pitch_t = time.perf_counter() - t
             y = self.voice._infer(audio16, self.shift, self.index_rate, self.protect, keep=keep,
                                   f0=self.f0_cache.copy())
+            steps = dict(self.voice.times)
+        t = time.perf_counter()
         y = resample(y, self.voice.tgt_sr, self.rate)
         need = self.block + self.cross + self.sola
         if len(y) < need:
@@ -410,7 +436,34 @@ class RVCStream:
         if len(self.prev) < self.cross:
             self.prev = np.pad(self.prev, (0, self.cross - len(self.prev)))
         self.last_cost = time.perf_counter() - t0
+        steps["pitch"] = steps.get("pitch", 0.0) + pitch_t
+        steps["audio"] = prep + (time.perf_counter() - t)
+        steps["total"] = self.last_cost
+        for name, value in steps.items():
+            hist = self.stats.setdefault(name, deque(maxlen=60))
+            hist.append(value)
         return np.clip(out, -1, 1)
+
+    STEP_NAMES = {
+        "features": "Speech features (ContentVec)",
+        "index": "Voice match (.index search)",
+        "pitch": "Pitch tracking (RMVPE)",
+        "synthesis": "Voice synthesis (the model)",
+        "audio": "Resampling, level and blending",
+        "total": "Total per block",
+    }
+
+    def report_rows(self):
+        """[(step, average ms, worst ms, share of the time budget %)] over recent blocks."""
+        budget = self.block / self.rate
+        rows = []
+        for key, label in self.STEP_NAMES.items():
+            hist = self.stats.get(key)
+            if not hist:
+                continue
+            avg, worst = float(np.mean(hist)), float(np.max(hist))
+            rows.append((key, label, avg * 1000, worst * 1000, avg / budget * 100))
+        return rows
 
 
 TARGET_RMS = 0.08

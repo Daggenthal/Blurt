@@ -36,9 +36,9 @@ except ImportError:
     np = None
 
 try:
-    from blurt_voice.dsp import B1Droid  # live voice effects (numpy only)
+    from blurt_voice.dsp import B1Droid, NoiseGate  # live voice effects (numpy only)
 except ImportError:
-    B1Droid = None
+    B1Droid = NoiseGate = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -1699,7 +1699,12 @@ class Background(QtCore.QObject):
 
 
 class VoiceLive:
-    """Mic -> processor -> Blurt-Mic and/or your headphones, via parec/pacat."""
+    """Mic -> noise gate -> voice processor -> Blurt-Mic and/or your headphones.
+
+    Each output takes either the "plain" signal (the mic after the gate) or the "voice"
+    signal (after the voice changer), so Blurt-Mic can carry the gated normal voice while
+    you listen to a voice in your headphones.
+    """
     CHUNK = 480  # 10 ms
 
     def __init__(self):
@@ -1714,12 +1719,17 @@ class VoiceLive:
         self.queue = deque()
         self.wake = threading.Event()
         self.gen = 0  # bumps on every (re)start so old threads quit
+        self.gate = None
+        self.level_db = -120.0  # mic level, for the meter
+        self.blocks = 0
+        self.max_queue = 0
 
-    def start(self, source, processor, block=0):
+    def start(self, source, processor=None, block=0, gate=None):
         """block=0: process every 10 ms chunk inline (DSP). Otherwise fixed blocks (AI)."""
         self.stop()
-        self.processor, self.block = processor, block
+        self.processor, self.block, self.gate = processor, (block if processor else 0), gate
         self.cost, self.dropped = 0.0, 0
+        self.blocks = self.max_queue = 0
         self.gen += 1
         self.running = True
         self.reader = subprocess.Popen(
@@ -1727,24 +1737,33 @@ class VoiceLive:
              "--channels=1", "--latency-msec=10", "--raw", "--client-name=Blurt voice input"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         threading.Thread(target=self._read, args=(self.reader, self.gen), daemon=True).start()
-        if block:
+        if self.block:
             threading.Thread(target=self._work, args=(self.gen,), daemon=True).start()
 
-    def set_output(self, name, sink):
+    def set_output(self, name, sink, kind="voice"):
         with self.lock:
+            old = self.outs.get(name)
+            if old and sink and old[1] == sink:  # same place: keep the stream, maybe new kind
+                self.outs[name] = (old[0], sink, kind)
+                return
             old = self.outs.pop(name, None)
             if old:
+                old = old[0]
                 try:
                     old.stdin.close()
                 except OSError:
                     pass
                 old.terminate()
             if sink:
-                self.outs[name] = subprocess.Popen(
+                self.outs[name] = (subprocess.Popen(
                     ["pacat", "--playback", f"--device={sink}", "--format=float32le",
                      f"--rate={VOICE_RATE}", "--channels=1", "--latency-msec=30", "--raw",
                      f"--client-name=Blurt voice {name}"],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL), sink, kind)
+
+    def kind_of(self, name):
+        out = self.outs.get(name)
+        return out[2] if out else None
 
     def stop(self):
         self.running = False
@@ -1759,10 +1778,12 @@ class VoiceLive:
         for name in list(self.outs):
             self.set_output(name, None)
 
-    def _write(self, y):
+    def _write(self, y, kind):
         data = np.asarray(y, dtype="<f4").tobytes()
         with self.lock:
-            for name, proc in list(self.outs.items()):
+            for name, (proc, _sink, k) in list(self.outs.items()):
+                if k != kind:
+                    continue
                 try:
                     proc.stdin.write(data)
                     proc.stdin.flush()
@@ -1778,12 +1799,18 @@ class VoiceLive:
             if not data:
                 break
             x = np.frombuffer(data, dtype="<f4").astype(np.float32)
+            self.level_db = 20 * float(np.log10(np.sqrt(np.mean(x ** 2)) + 1e-9))
+            if self.gate is not None:
+                x = self.gate.process(x)
+            self._write(x, "plain")
+            if self.processor is None:
+                continue
             if not self.block:
                 t0 = time.perf_counter()
                 y = self.processor.process(x)
                 spent = (time.perf_counter() - t0) / (len(x) / VOICE_RATE)
                 self.cost += (spent - self.cost) * 0.05
-                self._write(y)
+                self._write(y, "voice")
                 continue
             pending.append(x)
             have += len(x)
@@ -1792,6 +1819,7 @@ class VoiceLive:
                 self.queue.append(joined[:self.block])
                 rest = joined[self.block:]
                 pending, have = ([rest], len(rest)) if len(rest) else ([], 0)
+                self.max_queue = max(self.max_queue, len(self.queue))
                 while len(self.queue) > 3:  # falling behind: skip audio to keep the delay down
                     self.queue.popleft()
                     self.dropped += 1
@@ -1809,9 +1837,10 @@ class VoiceLive:
                     y = np.zeros(len(block), np.float32)
                 if gen != self.gen:
                     break
+                self.blocks += 1
                 self.cost += (self.processor.last_cost / (len(block) / VOICE_RATE)
                               - self.cost) * 0.3
-                self._write(y)
+                self._write(y, "voice")
 
 
 class VoiceDialog(QtWidgets.QDialog):
@@ -1826,7 +1855,6 @@ class VoiceDialog(QtWidgets.QDialog):
         cfg.setdefault("b1", dict(B1_DEFAULTS))
         cfg.setdefault("responsiveness", "auto")
         self.cfg = cfg
-        self.live = VoiceLive()
         self.helpers = None          # shared AI helper networks, loaded once
         self.voices = {}             # model id -> loaded RVCVoice
         self.loading = False
@@ -1975,6 +2003,13 @@ class VoiceDialog(QtWidgets.QDialog):
         self.live_status = W.QLabel("")
         self.live_status.setWordWrap(True)
         ll.addWidget(self.live_status)
+        perf = W.QPushButton("Performance details…")
+        perf.setToolTip("Shows which step of the voice conversion takes the most time")
+        perf.clicked.connect(self.show_performance)
+        prow = W.QHBoxLayout()
+        prow.addWidget(perf)
+        prow.addStretch(1)
+        ll.addLayout(prow)
         lay.addWidget(live)
 
         self.status = W.QLabel("")
@@ -2397,9 +2432,9 @@ class VoiceDialog(QtWidgets.QDialog):
         self.store.save()
         if self.loading:
             return
-        self.live.stop()
         self.helpers = None  # rebuilt with the new option
         self.voices.clear()
+        self.win.update_mic_pipeline()  # normal (gated) mic while the engine reloads
         model = self._model()
         if model:
             self._prepare_ai(model)
@@ -2527,10 +2562,11 @@ class VoiceDialog(QtWidgets.QDialog):
             return
         processor, _block = self._make_processor(live=False)
         model = self._model()
+        source = self.win.gated(self.test_raw)
         if self.cfg["mode"] == "b1":
             b1 = processor
             pad = np.zeros(b1.latency + 4800, np.float32)
-            src = np.concatenate([self.test_raw, pad])
+            src = np.concatenate([source, pad])
             out = np.concatenate([b1.process(src[i:i + 480]) for i in range(0, len(src), 480)])
             self.test_out = out[b1.latency:b1.latency + len(self.test_raw)]
             self.status.setText("Done. Press “Play with voice”.")
@@ -2540,7 +2576,7 @@ class VoiceDialog(QtWidgets.QDialog):
         if not self._ai_ready(model):
             return
         voice = self.voices[model["id"]]
-        raw = self.test_raw
+        raw = source
         settings = (model["pitch"], model["index_rate"] / 100, model["protect"] / 100)
         self.status.setText(f"Converting with {model['name']}… (this takes a few seconds)")
         self.rec_btn.setEnabled(False)
@@ -2591,40 +2627,37 @@ class VoiceDialog(QtWidgets.QDialog):
             self.win._add_sound(*target, pcm=to_wav_pcm(self.test_out, VOICE_RATE))
 
     # ---- live --------------------------------------------------------------
+    @property
+    def live(self):
+        return self.win.live
+
     def wants_mic(self):
-        """True when Blurt-Mic should carry the changed voice instead of the raw mic."""
-        return self.on_mic.isChecked() and self.live.running
+        """True when Blurt-Mic carries the changed voice instead of the normal mic."""
+        return self.live.running and self.live.kind_of("mic") == "voice"
+
+    def voice_ready(self):
+        return self.cfg["mode"] == "b1" or self._ai_ready(self._model())
 
     def _live_changed(self, *_):
         self._restart_live()
 
     def _restart_live(self):
-        self.live.stop()
         want = self.on_mic.isChecked() or self.monitor.isChecked()
-        source = self.store.settings.get("mic", "")
-        processor, block = self._make_processor(live=True) if want else (None, 0)
-        if want and not source:
+        if want and not self.store.settings.get("mic", ""):
             self.live_status.setText("Pick your microphone under “Input” in the main window.")
-        elif want and processor is None:
+        elif want and not self.voice_ready():
             self.live_status.setText("Live voice starts once the voice is ready." if
                                      self.cfg["mode"] != "off" else
                                      "Pick a voice above to use it live.")
-        if processor is not None and source:
-            self.live.set_output("mic", MIX_SINK if self.on_mic.isChecked() else None)
-            out = device_id(self.win.engine.out_me.device()) or "@DEFAULT_SINK@"
-            self.live.set_output("monitor", out if self.monitor.isChecked() else None)
-            self.live.start(source, processor, block)
-        else:
-            self.live.set_output("mic", None)
-            self.live.set_output("monitor", None)
-        self.win.apply_mic_routing()
-        self.win.voice_btn.setText("🎙 Voice (on)" if self.wants_mic() else "🎙 Voice…")
+        self.win.update_mic_pipeline()
 
     def _update_live_status(self):
-        if not self.live.running:
-            if self.on_mic.isChecked() or self.monitor.isChecked():
+        if not self.live.running or self.live.processor is None:
+            if (self.on_mic.isChecked() or self.monitor.isChecked()) and \
+                    self.cfg["mode"] != "off" and not self.voice_ready():
                 return
-            self.live_status.setText("Live voice is off. Others hear your normal mic.")
+            gate = " (through the noise gate)" if self.live.gate is not None else ""
+            self.live_status.setText(f"Live voice is off. Others hear your normal mic{gate}.")
             return
         proc = self.live.processor
         own = proc.latency() if callable(getattr(proc, "latency", None)) else \
@@ -2650,12 +2683,247 @@ class VoiceDialog(QtWidgets.QDialog):
     def toggle_on_mic(self):
         self.on_mic.setChecked(not self.on_mic.isChecked())
 
+    def show_performance(self):
+        dlg = getattr(self, "perf_dlg", None) or PerfDialog(self)
+        self.perf_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+
     def shutdown(self):
-        self.live.close()
+        self.player.stop()
 
     def closeEvent(self, ev):
         self.player.stop()
         super().closeEvent(ev)
+
+
+PERF_LOG = DATA_DIR / "voice-performance.log"
+
+
+def _cpu_info():
+    info = {"model": "unknown", "mhz": None, "logical": os.cpu_count() or 1, "physical": None}
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+        names = re.findall(r"^model name\s*:\s*(.+)$", text, re.M)
+        mhz = [float(m) for m in re.findall(r"^cpu MHz\s*:\s*([\d.]+)$", text, re.M)]
+        if names:
+            info["model"] = names[0].strip()
+        if mhz:
+            info["mhz"] = (sum(mhz) / len(mhz), max(mhz))
+        info["physical"] = len({Path(f"/sys/devices/system/cpu/cpu{c}/topology/"
+                                     "thread_siblings_list").read_text().strip()
+                                for c in os.sched_getaffinity(0)})
+    except (OSError, ValueError, AttributeError):
+        pass
+    return info
+
+
+def _process_cpu_seconds():
+    try:
+        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _rss_mb():
+    try:
+        m = re.search(r"VmRSS:\s+(\d+)", Path("/proc/self/status").read_text())
+        return int(m.group(1)) // 1024 if m else None
+    except OSError:
+        return None
+
+
+class PerfDialog(QtWidgets.QDialog):
+    """What the live voice is spending its time on, plus the things that affect it."""
+
+    def __init__(self, voice_dlg):
+        super().__init__(voice_dlg)
+        self.voice_dlg = voice_dlg
+        self.setWindowTitle("Voice performance")
+        self.resize(760, 560)
+        W = QtWidgets
+        lay = W.QVBoxLayout(self)
+        lay.addWidget(W.QLabel("Live numbers while the voice is running. “Share” is how much of "
+                               "each block's time budget a step uses; over 100% in total means "
+                               "audio gets skipped."))
+        self.text = W.QPlainTextEdit()
+        self.text.setReadOnly(True)
+        font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self.text.setFont(font)
+        lay.addWidget(self.text, 1)
+        row = W.QHBoxLayout()
+        self.log_box = W.QCheckBox(f"Also write to {PERF_LOG.name} every 15 s")
+        self.log_box.setToolTip(str(PERF_LOG))
+        self.log_box.setChecked(True)
+        row.addWidget(self.log_box)
+        row.addStretch(1)
+        for label, slot in (("Copy report", self.copy), ("Save report…", self.save),
+                            ("Open log folder", lambda: show_in_file_manager(PERF_LOG.parent)),
+                            ("Reset numbers", self.reset)):
+            b = W.QPushButton(label)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.cpu = _cpu_info()
+        self._last_cpu = (_process_cpu_seconds(), time.monotonic())
+        self._blurt_cpu = None
+        self._last_log = 0.0
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(1000)
+        self.refresh()
+
+    def reset(self):
+        proc = self.voice_dlg.live.processor
+        if proc is not None and hasattr(proc, "stats"):
+            proc.stats.clear()
+        live = self.voice_dlg.live
+        live.dropped = live.blocks = live.max_queue = 0
+
+    def _blurt_cpu_percent(self):
+        now_cpu, now = _process_cpu_seconds(), time.monotonic()
+        last_cpu, last = self._last_cpu
+        self._last_cpu = (now_cpu, now)
+        if now_cpu is None or last_cpu is None or now - last <= 0:
+            return None
+        return (now_cpu - last_cpu) / (now - last) * 100  # 100% = one full core
+
+    def report(self):
+        d, live = self.voice_dlg, self.voice_dlg.live
+        proc = live.processor if live.running else None
+        lines = [f"Blurt voice performance report - {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        model = d._model()
+        lines.append(f"Voice: {d.mode.currentText()}")
+        if proc is None:
+            lines.append("Live voice is not running. Tick “Others hear this voice” or “Hear "
+                         "myself live” to see live numbers.")
+        rows = proc.report_rows() if hasattr(proc, "report_rows") else []
+        diagnosis = []
+        if hasattr(proc, "block"):
+            budget = proc.block / VOICE_RATE * 1000
+            lines.append(f"Block: {budget:.0f} ms of audio per step (time budget {budget:.0f} ms), "
+                         f"context {len(proc.buf16) / 16000 - proc.tail16 / 16000:.2f} s, "
+                         f"crossfade {proc.cross / VOICE_RATE * 1000:.0f} ms")
+            lines.append(f"Blocks converted: {live.blocks}, skipped (too slow): {live.dropped}, "
+                         f"silent (not converted): {proc.silent_blocks}, "
+                         f"longest wait queue: {live.max_queue}")
+            lines.append("")
+            lines.append(f"{'Step':38s} {'average':>9s} {'worst':>9s} {'share':>7s}")
+            for key, label, avg, worst, share in rows:
+                lines.append(f"{label:38s} {avg:7.0f}ms {worst:7.0f}ms {share:6.0f}%")
+            steps = [r for r in rows if r[0] != "total"]
+            total = next((r for r in rows if r[0] == "total"), None)
+            if steps and total:
+                top = max(steps, key=lambda r: r[2])
+                hints = {
+                    "synthesis": "The voice model itself is the slowest part. The graphics card "
+                                 "helps most (install.sh --ai-voice-gpu). 48 kHz models are "
+                                 "slower than 40 kHz ones, and “Smooth” responsiveness gives it "
+                                 "more time per block.",
+                    "features": "Speech features are the slowest part. “Fast” responsiveness "
+                                "uses less context, which makes this step quicker.",
+                    "index": "The .index search is the slowest part. Lower “Voice match” to 0 "
+                             "to skip it, or try a model with a smaller index.",
+                    "pitch": "Pitch tracking is the slowest part, which is unusual. Other "
+                             "programs may be using the CPU.",
+                    "audio": "Resampling and blending is the slowest part, which is unusual. "
+                             "Other programs may be using the CPU.",
+                }
+                diagnosis.append(f"Slowest step: {top[1]} ({top[4]:.0f}% of the budget).")
+                if total[4] > 85 or live.dropped:
+                    diagnosis.append(hints.get(top[0], ""))
+                    if total[3] > 1.5 * total[2]:
+                        diagnosis.append("The worst blocks take much longer than average, which "
+                                         "points to other programs or the CPU slowing down to "
+                                         "save power.")
+                else:
+                    diagnosis.append("The voice keeps up with real time.")
+        elif proc is not None:
+            lines.append(f"Effect processing uses {live.cost * 100:.0f}% of real time.")
+        lines.append("")
+        lines.append("Computer")
+        cpu = self.cpu
+        mhz = _cpu_info()["mhz"]
+        lines.append(f"  CPU: {cpu['model']} ({cpu['physical'] or '?'} cores, "
+                     f"{cpu['logical']} threads)")
+        if mhz:
+            lines.append(f"  CPU speed now: {mhz[0]:.0f} MHz average, {mhz[1]:.0f} MHz fastest core")
+        try:
+            la = os.getloadavg()
+            lines.append(f"  System load (1/5/15 min): {la[0]:.2f} {la[1]:.2f} {la[2]:.2f}")
+            if cpu["logical"] and la[0] > cpu["logical"] * 0.8:
+                diagnosis.append("The computer is very busy overall (high system load). Close "
+                                 "games or other heavy programs while using the AI voice.")
+        except OSError:
+            pass
+        usage = self._blurt_cpu
+        if usage is not None:
+            lines.append(f"  Blurt is using {usage:.0f}% CPU (100% = one core)")
+        rss = _rss_mb()
+        if rss:
+            lines.append(f"  Blurt memory: {rss} MB")
+        if d.helpers is not None:
+            import torch
+            lines.append(f"  Voice engine: {d.helpers.describe()}, torch {torch.__version__}, "
+                         f"{torch.get_num_threads()} threads")
+            if d.helpers.device == "cuda":
+                try:
+                    lines.append(f"  Graphics card: {torch.cuda.get_device_name(0)}")
+                except Exception:
+                    pass
+            elif torch.cuda.is_available() is False and d.cfg.get("use_gpu", True):
+                lines.append("  Graphics card: not available to PyTorch (CPU build, or the "
+                             "card is not supported)")
+        if model and model["id"] in d.voices:
+            v = d.voices[model["id"]]
+            idx = "none"
+            if v.index is not None:
+                kind = type(v.index).__name__
+                idx = f"{kind}, {v.index.ntotal:,} entries"
+            size = Path(model["pth"]).stat().st_size // 1048576 if Path(model["pth"]).exists() else 0
+            lines.append("")
+            lines.append("Model")
+            lines.append(f"  {model['name']}: RVC {v.version}, {v.tgt_sr // 1000} kHz, "
+                         f"{'with' if v.if_f0 else 'without'} pitch, {size} MB")
+            lines.append(f"  Index: {idx}")
+            lines.append(f"  Settings: pitch {model['pitch']:+d}, voice match "
+                         f"{model['index_rate']}%, protect {model['protect']}%, responsiveness "
+                         f"{d.cfg['responsiveness']}")
+        if diagnosis:
+            lines.append("")
+            lines.append("What it means")
+            lines += [f"  - {t}" for t in diagnosis if t]
+        return "\n".join(lines)
+
+    def refresh(self):
+        self._blurt_cpu = self._blurt_cpu_percent()
+        text = self.report()
+        scroll = self.text.verticalScrollBar().value()
+        self.text.setPlainText(text)
+        self.text.verticalScrollBar().setValue(scroll)
+        live = self.voice_dlg.live
+        if (self.log_box.isChecked() and live.running and live.processor is not None
+                and time.monotonic() - self._last_log > 15):
+            self._last_log = time.monotonic()
+            try:
+                if PERF_LOG.exists() and PERF_LOG.stat().st_size > 2 * 1048576:
+                    PERF_LOG.replace(PERF_LOG.with_suffix(".old.log"))
+                with open(PERF_LOG, "a") as f:
+                    f.write(text + "\n\n" + "-" * 70 + "\n\n")
+            except OSError:
+                pass
+
+    def copy(self):
+        QtWidgets.QApplication.clipboard().setText(self.report())
+        self.voice_dlg.status.setText("Performance report copied.")
+
+    def save(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save performance report", str(Path.home() / "blurt-performance.txt"),
+            "Text files (*.txt)")
+        if path:
+            Path(path).write_text(self.report())
 
 
 class SortItem(QtWidgets.QTreeWidgetItem):
@@ -2869,7 +3137,8 @@ class VoiceSearchDialog(QtWidgets.QDialog):
 ACTIONS = {"stop": "Stop", "pause": "Pause / resume", "random": "Play random sound",
            "clip": "Clip what just played", "replay_clip": "Replay last clip",
            "save_clip": "Save last clip to library",
-           "voice": "Voice changer on/off (for others)"}
+           "voice": "Voice changer on/off (for others)",
+           "gate": "Noise gate on/off"}
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -2881,6 +3150,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clipper = Clipper()
         self.tee = OutputTee()
         self.tee.start()
+        self.live = VoiceLive()  # mic processing: noise gate and voice changer
+        self.gate = None
         self.last_clip = None
         shutil.rmtree(CLIPS_DIR, ignore_errors=True)
         self.setWindowTitle(APP)
@@ -3021,6 +3292,39 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(W.QLabel("Clip from:"), 2, 0)
         grid.addWidget(self.clip_combo, 2, 1)
         grid.addLayout(clip_row, 2, 2, 1, 3)
+        gate_cfg = self.store.settings.setdefault("gate", {"on": False, "threshold": -45})
+        gate_row = W.QHBoxLayout()
+        self.gate_box = W.QCheckBox("On")
+        self.gate_box.setToolTip("Mutes your mic when you are not talking, so breaths, typing "
+                                 "and background noise are not heard. Raise the threshold if "
+                                 "they still get through.")
+        self.gate_box.setChecked(bool(gate_cfg["on"]))
+        self.gate_box.toggled.connect(self._gate_toggled)
+        self.gate_slider = W.QSlider(Qt.Horizontal)
+        self.gate_slider.setRange(-70, -10)
+        self.gate_slider.setValue(int(gate_cfg["threshold"]))
+        self.gate_slider.setToolTip("Threshold: sounds quieter than this are muted")
+        self.gate_slider.valueChanged.connect(self._gate_threshold)
+        self.gate_slider.sliderReleased.connect(self.store.save)
+        self.gate_value = W.QLabel(f"{int(gate_cfg['threshold'])} dB")
+        self.gate_value.setMinimumWidth(50)
+        self.meter = W.QProgressBar()
+        self.meter.setRange(-70, 0)
+        self.meter.setValue(-70)
+        self.meter.setFormat("off")
+        self.meter.setTextVisible(True)
+        self.meter.setMaximumWidth(220)
+        self.meter.setToolTip("Your mic level. Set the threshold just above where it sits "
+                              "when you are quiet or typing.")
+        for wdg in (self.gate_box, self.gate_slider, self.gate_value, self.meter):
+            gate_row.addWidget(wdg)
+        if NoiseGate is None:
+            self.gate_box.setEnabled(False)
+        grid.addWidget(W.QLabel("Noise gate:"), 3, 0)
+        grid.addLayout(gate_row, 3, 1, 1, 4)
+        self.meter_timer = QtCore.QTimer(self)
+        self.meter_timer.timeout.connect(self._update_meter)
+        self.meter_timer.start(100)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         root.addLayout(grid)
@@ -3072,10 +3376,70 @@ class MainWindow(QtWidgets.QMainWindow):
             self.apply_mic_routing()
 
     def apply_mic_routing(self):
-        """Blurt-Mic carries the raw mic, unless the voice changer is feeding it instead."""
+        self.update_mic_pipeline()
+
+    def update_mic_pipeline(self):
+        """Decide what Blurt-Mic carries: the raw mic (lowest delay), the mic through the
+        noise gate, or the voice changer; and whether you hear the voice yourself."""
+        if not hasattr(self, "live"):
+            return
         dlg = getattr(self, "voice_dlg", None)
-        mic = self.store.settings.get("mic", "")
-        self.router.set_mic(None if dlg and dlg.wants_mic() else mic)
+        gate_cfg = self.store.settings.setdefault("gate", {"on": False, "threshold": -45})
+        source = self.store.settings.get("mic", "")
+        voice_mic = bool(dlg and dlg.on_mic.isChecked())
+        monitor = bool(dlg and dlg.monitor.isChecked())
+        proc, block = (None, 0)
+        if dlg and (voice_mic or monitor) and source:
+            proc, block = dlg._make_processor(live=True)
+        gate_on = bool(gate_cfg["on"] and NoiseGate is not None and source)
+        mic_kind = "voice" if voice_mic and proc is not None else ("plain" if gate_on else None)
+        mon_kind = "voice" if monitor and proc is not None else None
+        self.live.stop()
+        self.live.set_output("mic", MIX_SINK if mic_kind else None, mic_kind or "plain")
+        out = device_id(self.engine.out_me.device()) or "@DEFAULT_SINK@"
+        self.live.set_output("monitor", out if mon_kind else None, "voice")
+        self.gate = NoiseGate(gate_cfg["threshold"]) if gate_on else None
+        if mic_kind or mon_kind:
+            uses_voice = mic_kind == "voice" or mon_kind == "voice"
+            self.live.start(source, proc if uses_voice else None, block, self.gate)
+        self.router.set_mic(None if mic_kind else source)
+        self.voice_btn.setText("🎙 Voice (on)" if mic_kind == "voice" else "🎙 Voice…")
+
+    def gated(self, audio):
+        """Run a recording through the noise gate (when it is on), without its delay."""
+        cfg = self.store.settings.get("gate", {})
+        if not cfg.get("on") or NoiseGate is None or audio is None:
+            return audio
+        gate = NoiseGate(cfg.get("threshold", -45))
+        padded = np.concatenate([audio, np.zeros(gate.latency, np.float32)])
+        out = np.concatenate([gate.process(padded[i:i + 480]) for i in range(0, len(padded), 480)])
+        return out[gate.latency:gate.latency + len(audio)]
+
+    def _gate_toggled(self, on):
+        self.store.settings.setdefault("gate", {"on": False, "threshold": -45})["on"] = on
+        self.store.save()
+        self.update_mic_pipeline()
+        self.statusBar().showMessage("Noise gate on" if on else "Noise gate off", 3000)
+
+    def _gate_threshold(self, value):
+        self.store.settings.setdefault("gate", {"on": False, "threshold": -45})["threshold"] = value
+        self.gate_value.setText(f"{value} dB")
+        if self.gate is not None:
+            self.gate.threshold_db = value
+
+    def toggle_gate(self):
+        self.gate_box.setChecked(not self.gate_box.isChecked())
+
+    def _update_meter(self):
+        if self.live.running:
+            level = max(-70, min(0, int(self.live.level_db)))
+            self.meter.setValue(level)
+            open_ = self.gate is None or self.gate.is_open
+            self.meter.setFormat("talking" if open_ and self.gate is not None else
+                                 "muted" if self.gate is not None else f"{level} dB")
+        else:
+            self.meter.setValue(-70)
+            self.meter.setFormat("off")
 
     def open_voice(self):
         if not getattr(self, "voice_dlg", None):
@@ -3097,6 +3461,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def shutdown_voice(self):
         if getattr(self, "voice_dlg", None):
             self.voice_dlg.shutdown()
+        self.live.close()
 
     def refresh_outputs(self):
         saved = self.store.settings.get("output", "")
@@ -3600,7 +3965,7 @@ class MainWindow(QtWidgets.QMainWindow):
             {"stop": self.engine.stop, "pause": self.engine.toggle_pause,
              "random": self.play_random, "clip": self.clip,
              "replay_clip": self.replay_clip, "save_clip": self.save_clip_quick,
-             "voice": self.toggle_voice}[target]()
+             "voice": self.toggle_voice, "gate": self.toggle_gate}[target]()
 
     def eventFilter(self, obj, ev):
         # Fallback when /dev/input is not readable: hotkeys while the window has focus.
