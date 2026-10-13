@@ -85,6 +85,8 @@ def pick_device(use_gpu=True):
     """'cuda' (NVIDIA, or AMD through ROCm) when it really works, otherwise 'cpu'."""
     global GPU_ERROR
     GPU_ERROR = ""
+    # live blocks always have the same size, so let cuDNN/MIOpen pick the fastest kernels once
+    torch.backends.cudnn.benchmark = True
     if not use_gpu:
         GPU_ERROR = "turned off in Blurt"
         return "cpu"
@@ -247,6 +249,13 @@ class RVCVoice:
         del net.enc_q
         net.load_state_dict({k: v.float() for k, v in cpt["weight"].items()}, strict=False)
         self.device = helpers.device
+        # weight normalisation only matters for training; folding it into the weights once
+        # saves recomputing it on every block
+        for part in (getattr(net, "dec", None), getattr(net, "flow", None)):
+            try:
+                part.remove_weight_norm()
+            except (AttributeError, ValueError, RuntimeError):
+                pass
         self.net = net.eval().float().to(self.device)
         self.index = self.big_npy = None
         if index_path and faiss is not None and os.path.isfile(index_path):
@@ -538,10 +547,12 @@ def benchmark(voice, block_s=0.45, context_s=1.0):
     test = (0.1 * np.sign(np.sin(2 * np.pi * 140 * t)) * np.sin(2 * np.pi * 3 * t) ** 2
             ).astype(np.float32)
     costs = []
-    for i in range(3):
-        stream.process(test[i * stream.block:(i + 1) * stream.block])
+    rounds = 6 if voice.device == "cuda" else 3
+    test = np.tile(test, 2)
+    for i in range(rounds):
+        stream.process(test[(i % 3) * stream.block:((i % 3) + 1) * stream.block])
         costs.append(stream.last_cost)
-    return min(costs[1:]) / block_s
+    return float(np.median(costs[2:] if rounds > 3 else costs[1:])) / block_s
 
 
 def load_index(path):

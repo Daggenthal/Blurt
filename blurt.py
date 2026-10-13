@@ -1698,6 +1698,58 @@ class Background(QtCore.QObject):
             self.done.emit(None, e)
 
 
+class PacatOut:
+    """One playback stream (pacat) fed by its own thread.
+
+    Writing a long block straight into pacat blocks until most of it has played, which used
+    to stall the voice conversion and made it fall behind (choppy audio). Now the converted
+    audio is handed over instantly and this thread does the waiting.
+    """
+    MAX_QUEUED = VOICE_RATE * 4 * 3  # bytes: about 3 s; older audio is dropped beyond that
+
+    def __init__(self, name, sink, kind):
+        self.sink, self.kind = sink, kind
+        self.proc = subprocess.Popen(
+            ["pacat", "--playback", f"--device={sink}", "--format=float32le",
+             f"--rate={VOICE_RATE}", "--channels=1", "--latency-msec=30", "--raw",
+             f"--client-name=Blurt voice {name}"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.queue = deque()
+        self.queued = 0
+        self.event = threading.Event()
+        self.alive = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def put(self, data):
+        self.queue.append(data)
+        self.queued += len(data)
+        while self.queued > self.MAX_QUEUED and len(self.queue) > 1:
+            self.queued -= len(self.queue.popleft())
+        self.event.set()
+
+    def _run(self):
+        while self.alive:
+            self.event.wait(0.5)
+            self.event.clear()
+            while self.alive and self.queue:
+                data = self.queue.popleft()
+                self.queued -= len(data)
+                try:
+                    self.proc.stdin.write(data)
+                    self.proc.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    self.alive = False
+
+    def close(self):
+        self.alive = False
+        self.event.set()
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.proc.terminate()
+
+
 class VoiceLive:
     """Mic -> noise gate -> voice processor -> Blurt-Mic and/or your headphones.
 
@@ -1723,10 +1775,16 @@ class VoiceLive:
         self.level_db = -120.0  # mic level, for the meter
         self.blocks = 0
         self.max_queue = 0
+        self.out_delay = 0.0   # fixed time from the end of a block to playing it (AI voices)
+        self.late = 0          # blocks that finished after their play time
 
-    def start(self, source, processor=None, block=0, gate=None):
-        """block=0: process every 10 ms chunk inline (DSP). Otherwise fixed blocks (AI)."""
+    def start(self, source, processor=None, block=0, gate=None, out_delay=0.0):
+        """block=0: process every 10 ms chunk inline (DSP). Otherwise fixed blocks (AI),
+        played out at a steady out_delay seconds after each block was recorded."""
         self.stop()
+        self.out_delay = self.min_delay = max(0.05, out_delay)
+        self.late = 0
+        self._early_run = 0
         self.processor, self.block, self.gate = processor, (block if processor else 0), gate
         self.cost, self.dropped = 0.0, 0
         self.blocks = self.max_queue = 0
@@ -1743,27 +1801,18 @@ class VoiceLive:
     def set_output(self, name, sink, kind="voice"):
         with self.lock:
             old = self.outs.get(name)
-            if old and sink and old[1] == sink:  # same place: keep the stream, maybe new kind
-                self.outs[name] = (old[0], sink, kind)
+            if old and sink and old.sink == sink and old.alive:  # same place: keep the stream
+                old.kind = kind
                 return
             old = self.outs.pop(name, None)
             if old:
-                old = old[0]
-                try:
-                    old.stdin.close()
-                except OSError:
-                    pass
-                old.terminate()
+                old.close()
             if sink:
-                self.outs[name] = (subprocess.Popen(
-                    ["pacat", "--playback", f"--device={sink}", "--format=float32le",
-                     f"--rate={VOICE_RATE}", "--channels=1", "--latency-msec=30", "--raw",
-                     f"--client-name=Blurt voice {name}"],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL), sink, kind)
+                self.outs[name] = PacatOut(name, sink, kind)
 
     def kind_of(self, name):
         out = self.outs.get(name)
-        return out[2] if out else None
+        return out.kind if out else None
 
     def stop(self):
         self.running = False
@@ -1781,14 +1830,13 @@ class VoiceLive:
     def _write(self, y, kind):
         data = np.asarray(y, dtype="<f4").tobytes()
         with self.lock:
-            for name, (proc, _sink, k) in list(self.outs.items()):
-                if k != kind:
+            for name, out in list(self.outs.items()):
+                if out.kind != kind:
                     continue
-                try:
-                    proc.stdin.write(data)
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError, ValueError):
+                if not out.alive:
                     self.outs.pop(name, None)
+                    continue
+                out.put(data)  # never blocks: each output has its own writer thread
 
     def _read(self, reader, gen):
         size = self.CHUNK * 4
@@ -1816,7 +1864,7 @@ class VoiceLive:
             have += len(x)
             if have >= self.block:
                 joined = np.concatenate(pending)
-                self.queue.append(joined[:self.block])
+                self.queue.append((joined[:self.block], time.monotonic()))
                 rest = joined[self.block:]
                 pending, have = ([rest], len(rest)) if len(rest) else ([], 0)
                 self.max_queue = max(self.max_queue, len(self.queue))
@@ -1830,7 +1878,7 @@ class VoiceLive:
             self.wake.wait(0.5)
             self.wake.clear()
             while self.running and gen == self.gen and self.queue:
-                block = self.queue.popleft()
+                block, recorded = self.queue.popleft()
                 try:
                     y = self.processor.process(block)
                 except Exception:
@@ -1838,6 +1886,25 @@ class VoiceLive:
                 if gen != self.gen:
                     break
                 self.blocks += 1
+                # Play every block the same time after it was recorded. Quiet blocks are
+                # converted almost instantly and speech blocks take a while; writing each one
+                # as soon as it is ready would leave gaps after every pause (choppy speech).
+                due = recorded + self.out_delay
+                now = time.monotonic()
+                if now < due:
+                    self._early_run += 1
+                    while self.running and gen == self.gen and time.monotonic() < due:
+                        time.sleep(min(0.02, max(0.0, due - time.monotonic())))
+                    if self._early_run > 30 and self.out_delay > self.min_delay:
+                        self.out_delay = max(self.min_delay, self.out_delay - 0.005)
+                else:
+                    # finished late: there will be one small gap; wait a bit longer from now on
+                    self.late += 1
+                    self._early_run = 0
+                    self.out_delay = min(self.out_delay + (now - due) + 0.03,
+                                         2.5 * len(block) / VOICE_RATE)
+                if gen != self.gen:
+                    break
                 self.cost += (self.processor.last_cost / (len(block) / VOICE_RATE)
                               - self.cost) * 0.3
                 self._write(y, "voice")
@@ -2880,9 +2947,10 @@ class VoiceDialog(QtWidgets.QDialog):
             self.live_status.setText(f"Live voice is off. Others hear your normal mic{gate}.")
             return
         proc = self.live.processor
-        own = proc.latency() if callable(getattr(proc, "latency", None)) else \
-            getattr(proc, "latency", 0) / VOICE_RATE
-        delay = 0.04 + own
+        if self.live.block:  # AI: one block of recording plus the steady output delay
+            delay = 0.04 + self.live.block / VOICE_RATE + self.live.out_delay
+        else:
+            delay = 0.04 + getattr(proc, "latency", 0) / VOICE_RATE
         where = []
         if self.on_mic.isChecked():
             where.append("others hear it")
@@ -2890,7 +2958,7 @@ class VoiceDialog(QtWidgets.QDialog):
             where.append("you hear it")
         text = (f"Live ({' and '.join(where)}): about {delay:.2f} s delay, processing uses "
                 f"{self.live.cost * 100:.0f}% of real time.")
-        if self.live.cost > 0.9 or self.live.dropped:
+        if self.live.cost > 0.9 or self.live.dropped or self.live.late > 3:
             key = self.cfg["responsiveness"]
             key = self._auto_responsiveness() if key == "auto" else key
             on_gpu = self.helpers is not None and self.helpers.device == "cuda"
@@ -3002,7 +3070,7 @@ class PerfDialog(QtWidgets.QDialog):
         if proc is not None and hasattr(proc, "reset_stats"):
             proc.reset_stats()
         live = self.voice_dlg.live
-        live.dropped = live.blocks = live.max_queue = 0
+        live.dropped = live.blocks = live.max_queue = live.late = 0
 
     def _blurt_cpu_percent(self):
         proc = self.voice_dlg.client.proc
@@ -3038,6 +3106,8 @@ class PerfDialog(QtWidgets.QDialog):
             lines.append(f"Blocks converted: {live.blocks}, skipped (too slow): {live.dropped}, "
                          f"silent (not converted): {proc.silent_blocks}, "
                          f"longest wait queue: {live.max_queue}")
+            lines.append(f"Output delay after each block: {live.out_delay * 1000:.0f} ms, "
+                         f"blocks that finished late (a short gap each): {live.late}")
             lines.append("")
             lines.append(f"{'Step':38s} {'average':>9s} {'worst':>9s} {'share':>7s}")
             for key, label, avg, worst, share in rows:
@@ -3638,7 +3708,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gate = NoiseGate(gate_cfg["threshold"]) if gate_on else None
         if mic_kind or mon_kind:
             uses_voice = mic_kind == "voice" or mon_kind == "voice"
-            self.live.start(source, proc if uses_voice else None, block, self.gate)
+            out_delay = 0.0
+            if uses_voice and block and dlg:
+                # expected time to convert one block, with headroom, from the speed check
+                speed = dlg.cfg.get("speed") or 0.8
+                out_delay = speed * block / VOICE_RATE * 1.3 + 0.06
+            self.live.start(source, proc if uses_voice else None, block, self.gate, out_delay)
         self.router.set_mic(None if mic_kind else source)
         self.voice_btn.setText("🎙 Voice (on)" if mic_kind == "voice" else "🎙 Voice…")
 
