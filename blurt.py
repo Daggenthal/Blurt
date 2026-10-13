@@ -2719,7 +2719,13 @@ class VoiceDialog(QtWidgets.QDialog):
         if not speed:
             return "balanced"
         # speed is measured with 0.45 s blocks; small blocks cost relatively more, so the
-        # smaller presets need more headroom
+        # smaller presets need more headroom. On a graphics card most of the cost is fixed per
+        # block rather than per second of audio, and 0.16 s blocks have proven fine there.
+        if self.helpers is not None and self.helpers.device == "cuda":
+            if speed < 0.35:
+                return "fastest"
+            if speed < 0.5:
+                return "faster"
         if speed < 0.12:
             return "fastest"
         if speed < 0.2:
