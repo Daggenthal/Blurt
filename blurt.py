@@ -36,9 +36,9 @@ except ImportError:
     np = None
 
 try:
-    from blurt_voice.dsp import B1Droid, NoiseGate  # live voice effects (numpy only)
+    from blurt_voice.dsp import B1Droid, NoiseGate, OutputLevel  # live effects (numpy only)
 except ImportError:
-    B1Droid = NoiseGate = None
+    B1Droid = NoiseGate = OutputLevel = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -1774,16 +1774,18 @@ class VoiceLive:
         self.wake = threading.Event()
         self.gen = 0  # bumps on every (re)start so old threads quit
         self.gate = None
+        self.out_level = None   # boost / auto level for the changed voice
         self.level_db = -120.0  # mic level, for the meter
         self.blocks = 0
         self.max_queue = 0
         self.out_delay = 0.0   # fixed time from the end of a block to playing it (AI voices)
         self.late = 0          # blocks that finished after their play time
 
-    def start(self, source, processor=None, block=0, gate=None, out_delay=0.0):
+    def start(self, source, processor=None, block=0, gate=None, out_delay=0.0, out_level=None):
         """block=0: process every 10 ms chunk inline (DSP). Otherwise fixed blocks (AI),
         played out at a steady out_delay seconds after each block was recorded."""
         self.stop()
+        self.out_level = out_level
         self.out_delay = self.min_delay = max(0.05, out_delay)
         self.late = 0
         self._early_run = 0
@@ -1860,6 +1862,8 @@ class VoiceLive:
                 y = self.processor.process(x)
                 spent = (time.perf_counter() - t0) / (len(x) / VOICE_RATE)
                 self.cost += (spent - self.cost) * 0.05
+                if self.out_level is not None:
+                    y = self.out_level.process(y)
                 self._write(y, "voice")
                 continue
             pending.append(x)
@@ -1913,6 +1917,8 @@ class VoiceLive:
                     break
                 self.cost += (self.processor.last_cost / (len(block) / VOICE_RATE)
                               - self.cost) * 0.3
+                if self.out_level is not None:
+                    y = self.out_level.process(y)
                 self._write(y, "voice")
 
 
@@ -2157,6 +2163,22 @@ class VoiceDialog(QtWidgets.QDialog):
         self.monitor.toggled.connect(self._live_changed)
         ll.addWidget(self.on_mic)
         ll.addWidget(self.monitor)
+        lrow = QtWidgets.QHBoxLayout()
+        lrow.addWidget(QtWidgets.QLabel("Output boost:"))
+        self.boost = QtWidgets.QSlider(Qt.Horizontal)
+        self.boost.setRange(-12, 18)
+        self.boost.setToolTip("Makes this voice louder (or quieter) for others and in tests. "
+                              "Saved per voice.")
+        self.boost_val = QtWidgets.QLabel("+0 dB")
+        self.boost_val.setMinimumWidth(52)
+        self.auto_level = QtWidgets.QCheckBox("Even out loudness")
+        self.auto_level.setToolTip("Automatically brings quiet voice models up to a normal "
+                                   "talking level. A soft limiter stops it from clipping.")
+        self.boost.valueChanged.connect(self._level_changed)
+        self.auto_level.toggled.connect(self._level_changed)
+        for wdg in (self.boost, self.boost_val, self.auto_level):
+            lrow.addWidget(wdg)
+        ll.addLayout(lrow)
         self.live_status = W.QLabel("")
         self.live_status.setWordWrap(True)
         ll.addWidget(self.live_status)
@@ -2221,6 +2243,7 @@ class VoiceDialog(QtWidgets.QDialog):
         mode = self.cfg["mode"]
         model = self._model()
         self.b1_box.setVisible(mode == "b1")
+        self._show_level()
         self.ai_box.setVisible(model is not None)
         self.remove_btn.setEnabled(model is not None or mode == "b1")
         self.test_out = None
@@ -2312,7 +2335,43 @@ class VoiceDialog(QtWidgets.QDialog):
         dlg.raise_()
 
     # ---- saved settings (presets) ----------------------------------------------
-    PRESET_KEYS = ("pitch", "index_rate", "protect", "voice_type", "auto")
+    PRESET_KEYS = ("pitch", "index_rate", "protect", "voice_type", "auto", "gain_db",
+                   "auto_level")
+
+    # ---- output loudness (per voice) ---------------------------------------
+    def level_cfg(self):
+        """The current voice's loudness settings (an AI model, or the droid)."""
+        model = self._model()
+        if model is not None:
+            return model
+        if self.cfg["mode"] == "b1":
+            return self.cfg["b1"]
+        return {}
+
+    def _show_level(self):
+        lc = self.level_cfg()
+        for w in (self.boost, self.auto_level):
+            w.blockSignals(True)
+        self.boost.setValue(int(lc.get("gain_db", 0)))
+        self.auto_level.setChecked(bool(lc.get("auto_level", True)))
+        for w in (self.boost, self.auto_level):
+            w.blockSignals(False)
+        self.boost_val.setText(f"{self.boost.value():+d} dB")
+        on = bool(lc) or self.cfg["mode"] == "b1"
+        self.boost.setEnabled(on)
+        self.auto_level.setEnabled(on)
+
+    def _level_changed(self, *_):
+        self.boost_val.setText(f"{self.boost.value():+d} dB")
+        lc = self.level_cfg()
+        if not lc and self.cfg["mode"] != "b1":
+            return
+        lc["gain_db"] = self.boost.value()
+        lc["auto_level"] = self.auto_level.isChecked()
+        self.store.save()
+        level = self.live.out_level
+        if level is not None:  # takes effect live, no restart
+            level.gain_db, level.auto = lc["gain_db"], lc["auto_level"]
 
     def _fill_presets(self, model):
         self.preset.blockSignals(True)
@@ -2856,7 +2915,7 @@ class VoiceDialog(QtWidgets.QDialog):
             pad = np.zeros(b1.latency + 4800, np.float32)
             src = np.concatenate([source, pad])
             out = np.concatenate([b1.process(src[i:i + 480]) for i in range(0, len(src), 480)])
-            self.test_out = out[b1.latency:b1.latency + len(self.test_raw)]
+            self.test_out = self._leveled(out[b1.latency:b1.latency + len(self.test_raw)])
             self.status.setText("Done. Press “Play with voice”.")
             self._update_test_buttons()
             self._play_test(self.test_out)
@@ -2879,12 +2938,22 @@ class VoiceDialog(QtWidgets.QDialog):
             if error:
                 self.status.setText(f"Conversion failed: {error}")
             else:
-                self.test_out = out
+                self.test_out = out = self._leveled(out)
                 took = time.perf_counter() - started
                 self.status.setText(f"Done in {took:.1f} s. Playing it now.")
                 self._play_test(out)
             self._update_test_buttons()
         Background(self, work, finished)
+
+    def _leveled(self, audio):
+        """The test recording at the same loudness others will hear live."""
+        if OutputLevel is None or audio is None:
+            return audio
+        lc = self.level_cfg()
+        level = OutputLevel(lc.get("gain_db", 0), lc.get("auto_level", True))
+        step = 7680
+        return np.concatenate([level.process(audio[i:i + step])
+                               for i in range(0, len(audio), step)]) if len(audio) else audio
 
     def _play_test(self, audio):
         if audio is None:
@@ -3736,7 +3805,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 # expected time to convert one block, with headroom, from the speed check
                 speed = dlg.cfg.get("speed") or 0.8
                 out_delay = speed * block / VOICE_RATE * 1.25 + 0.04
-            self.live.start(source, proc if uses_voice else None, block, self.gate, out_delay)
+            level = None
+            if uses_voice and dlg and OutputLevel is not None:
+                lc = dlg.level_cfg()
+                level = OutputLevel(lc.get("gain_db", 0), lc.get("auto_level", True))
+            self.live.start(source, proc if uses_voice else None, block, self.gate, out_delay,
+                            level)
         self.router.set_mic(None if mic_kind else source)
         self.voice_btn.setText("🎙 Voice (on)" if mic_kind == "voice" else "🎙 Voice…")
 

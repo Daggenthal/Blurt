@@ -80,6 +80,7 @@ Click **Voice** in the main window.
 
 - **B1 Battle Droid** works right away. Pitch, size and metal can be adjusted. Any voice, this one included, can be removed with **Remove**, or several at once with **Manage voices**.
 - **AI voices** use RVC voice models (a `.pth` file, ideally with its `.index` file). Click **Find voices online** to search Hugging Face and add one in a click, or **Add from file** for a `.pth` or `.zip` you already have. Blurt does not include any models. Downloaded voices are kept in `~/.local/share/blurt/voices/`.
+- **Loudness:** each voice has an output boost, and "Even out loudness" brings quiet voice models up to a normal talking level, with a soft limiter so it never clips.
 - **Saved settings:** each voice remembers its own settings. **Save settings as** keeps named versions (for example "talking" and "singing"), with a backup next to the model file, so they come back even if the voice is removed and added again.
 - **Automatic settings:** after your first test recording, Blurt measures your voice and sets the pitch shift for the kind of voice you picked (high, medium or low). It also measures how fast your computer runs the voice and picks the live responsiveness.
 - **Test first:** press **Record 5 s test**, speak, and Blurt plays the result back only to you.

@@ -216,3 +216,39 @@ class NoiseGate:
         data = np.concatenate([self.delay, x])
         out, self.delay = data[:n], data[n:]
         return out * ramp
+
+
+class OutputLevel:
+    """Makes a changed voice loud enough: an optional fixed boost, optional automatic
+    levelling (quiet voice models come out as loud as the others), and a soft limiter so
+    boosting never clips harshly."""
+
+    def __init__(self, gain_db=0.0, auto=True, target_db=-17.0, max_boost_db=18.0):
+        self.gain_db, self.auto = gain_db, auto
+        self.target = 10 ** (target_db / 20)
+        self.max_boost = 10 ** (max_boost_db / 20)
+        self.env = 0.0
+        self.gain = 1.0
+
+    def process(self, y):
+        y = np.asarray(y, dtype=np.float32)
+        n = len(y)
+        if not n:
+            return y
+        target_gain = 10 ** (self.gain_db / 20)
+        if self.auto:
+            rms = float(np.sqrt(np.mean(y ** 2)))
+            if rms > 10 ** (-50 / 20):  # only learn from speech, not from silence
+                k = 1 - np.exp(-n / (RATE * 0.5))
+                self.env = rms if self.env == 0 else self.env + (rms - self.env) * k
+            if self.env > 0:
+                target_gain *= min(self.max_boost, max(0.5, self.target / self.env))
+        ramp = np.linspace(self.gain, target_gain, n, dtype=np.float32)
+        self.gain = float(target_gain)
+        out = y * ramp
+        # soft limiter: untouched below 0.8, then eases into 1.0
+        over = np.abs(out) > 0.8
+        if over.any():
+            a = np.abs(out[over])
+            out[over] = np.sign(out[over]) * (0.8 + 0.2 * np.tanh((a - 0.8) / 0.2))
+        return out
