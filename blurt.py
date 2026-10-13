@@ -1626,6 +1626,8 @@ VOICE_DIR = DATA_DIR / "voices"   # models unpacked from .zip files
 AI_ASSETS = DATA_DIR / "ai"       # shared helper networks, downloaded on first use
 RESPONSIVENESS = {  # key: (label, block seconds, context seconds)
     "auto": ("Auto (picked for this computer)", 0, 0),
+    "fastest": ("Fastest (graphics card)", 0.16, 1.0),
+    "faster": ("Faster", 0.22, 1.0),
     "fast": ("Fast (shorter delay, more glitches)", 0.3, 0.8),
     "balanced": ("Balanced", 0.45, 1.0),
     "smooth": ("Smooth (longer delay)", 0.7, 1.2),
@@ -1893,15 +1895,19 @@ class VoiceLive:
                 now = time.monotonic()
                 if now < due:
                     self._early_run += 1
+                    slack = due - now
                     while self.running and gen == self.gen and time.monotonic() < due:
                         time.sleep(min(0.02, max(0.0, due - time.monotonic())))
-                    if self._early_run > 30 and self.out_delay > self.min_delay:
-                        self.out_delay = max(self.min_delay, self.out_delay - 0.005)
+                    # plenty of spare time for a while: bring the delay back down
+                    if self._early_run > 8 and slack > 0.08 and self.out_delay > self.min_delay:
+                        self.out_delay = max(self.min_delay, self.out_delay - 0.01)
                 else:
-                    # finished late: there will be one small gap; wait a bit longer from now on
+                    # finished late: there will be one small gap; wait a bit longer from now
+                    # on, but don't let one freak block (e.g. the GPU picking kernels) add a
+                    # whole second of delay forever
                     self.late += 1
                     self._early_run = 0
-                    self.out_delay = min(self.out_delay + (now - due) + 0.03,
+                    self.out_delay = min(self.out_delay + min(now - due, 0.12) + 0.02,
                                          2.5 * len(block) / VOICE_RATE)
                 if gen != self.gen:
                     break
@@ -2656,6 +2662,8 @@ class VoiceDialog(QtWidgets.QDialog):
                     " (the .index file needs faiss, which is not installed, so it is skipped)"
                 self.cfg["speed"] = voice.speed
                 self.store.save()
+                if getattr(voice, "describe", None) and self.helpers is not None:
+                    self.helpers._describe = voice.describe  # after GPU tuning
                 pick = self._auto_responsiveness()
                 if self.cfg.get("use_gpu", True) and self.helpers.device != "cuda":
                     note += f" (graphics card not used: {self.helpers.gpu_error})"
@@ -2710,6 +2718,12 @@ class VoiceDialog(QtWidgets.QDialog):
         speed = self.cfg.get("speed")
         if not speed:
             return "balanced"
+        # speed is measured with 0.45 s blocks; small blocks cost relatively more, so the
+        # smaller presets need more headroom
+        if speed < 0.12:
+            return "fastest"
+        if speed < 0.2:
+            return "faster"
         return "fast" if speed < 0.4 else "balanced" if speed < 0.7 else "smooth"
 
     def _resp_changed(self, _i):
@@ -3194,6 +3208,9 @@ class PerfDialog(QtWidgets.QDialog):
             lines.append(f"  {model['name']}: RVC {v.version}, {v.tgt_sr // 1000} kHz, "
                          f"{'with' if v.if_f0 else 'without'} pitch, {size} MB")
             lines.append(f"  Index: {idx}")
+            for label, ms, err in getattr(v, "tuning", None) or []:
+                lines.append(f"  GPU tuning, {label}: " + (f"{ms:.0f} ms per 0.3 s block"
+                                                           if ms else f"failed ({err[:60]})"))
             lines.append(f"  Settings: pitch {model['pitch']:+d}, voice match "
                          f"{model['index_rate']}%, protect {model['protect']}%, responsiveness "
                          f"{d.cfg['responsiveness']}")
@@ -3712,7 +3729,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if uses_voice and block and dlg:
                 # expected time to convert one block, with headroom, from the speed check
                 speed = dlg.cfg.get("speed") or 0.8
-                out_delay = speed * block / VOICE_RATE * 1.3 + 0.06
+                out_delay = speed * block / VOICE_RATE * 1.25 + 0.04
             self.live.start(source, proc if uses_voice else None, block, self.gate, out_delay)
         self.router.set_mic(None if mic_kind else source)
         self.voice_btn.setText("🎙 Voice (on)" if mic_kind == "voice" else "🎙 Voice…")

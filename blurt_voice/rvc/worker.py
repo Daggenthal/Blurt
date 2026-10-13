@@ -48,6 +48,7 @@ def main():
         device = engine.pick_device(use_gpu)
         print(f"[engine] device {device} {engine.GPU_ERROR}", file=sys.stderr, flush=True)
         state["helpers"] = engine.Helpers(folder, device=device, fast_math=fast_math)
+        state["fast_math"] = fast_math
         state["voices"].clear()
         gpu_name = ""
         if device == "cuda":
@@ -63,6 +64,10 @@ def main():
         progress("Loading the voice… (the first time, a big .index file can take a minute to "
                  "prepare)")
         voice = engine.RVCVoice(state["helpers"], pth, index)
+        tuning = engine.tune_gpu(voice, allow_half=state["fast_math"], progress=progress)
+        for label, ms, err in tuning:
+            print(f"[engine] tuning {label}: " + (f"{ms:.0f} ms per block" if ms else err),
+                  file=sys.stderr, flush=True)
         progress("Measuring how fast this computer runs the voice…")
         speed = engine.benchmark(voice)
         state["voices"][vid] = voice
@@ -70,7 +75,8 @@ def main():
         if voice.index is not None:
             info = (type(voice.index).__name__, int(voice.index.ntotal))
         return {"tgt_sr": voice.tgt_sr, "if_f0": voice.if_f0, "version": voice.version,
-                "index_info": info, "speed": speed}
+                "index_info": info, "speed": speed, "tuning": tuning,
+                "describe": state["helpers"].describe()}
 
     def convert(vid, audio, sr, shift, index_rate, protect, progress):
         y, tsr = state["voices"][vid].convert(audio, sr, shift, index_rate, protect)
@@ -82,6 +88,8 @@ def main():
     def stream_new(vid, block_s, context_s, shift, index_rate, protect, progress):
         s = engine.RVCStream(state["voices"][vid], block_s=block_s, context_s=context_s,
                              shift=shift, index_rate=index_rate, protect=protect)
+        progress("Warming up…")
+        engine.warm_up(s)  # so the first real words are not slow
         state["stream"] = s
         return {"block": s.block, "cross": s.cross, "context_s": s.extra16 / engine.SR}
 

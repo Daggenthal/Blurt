@@ -203,8 +203,11 @@ class Helpers:
     def describe(self):
         where = "graphics card" if self.device == "cuda" else "CPU"
         fast = {torch.float16: ", float16", torch.bfloat16: ", bfloat16"}.get(
-            self.autocast[1] if self.autocast else None, "")
-        return where + fast
+            self.autocast[1] if self.autocast else None, ", float32")
+        kernels = ""
+        if self.device == "cuda" and not torch.backends.cudnn.enabled:
+            kernels = ", PyTorch's own kernels"
+        return where + fast + kernels
 
     def features(self, audio16, version):
         x = torch.from_numpy(np.ascontiguousarray(audio16, dtype=np.float32)).view(1, -1)
@@ -605,6 +608,64 @@ def _pitch_pool():
         from concurrent.futures import ThreadPoolExecutor
         _POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="blurt-pitch")
     return _POOL
+
+
+def _test_voice(seconds, rate=48000):
+    t = np.arange(int(seconds * rate)) / rate
+    f0 = 140 + 25 * np.sin(2 * np.pi * 0.8 * t)
+    ph = 2 * np.pi * np.cumsum(f0) / rate
+    return (0.12 * sum(np.sin(k * ph) / k for k in range(1, 12))).astype(np.float32)
+
+
+def warm_up(stream, blocks=2):
+    """Run a few speech-like blocks so the GPU picks and compiles its kernels before the
+    real audio arrives (the first block on a new size can take seconds)."""
+    test = _test_voice(stream.block * blocks / stream.rate + 0.1)
+    for i in range(blocks):
+        stream.process(test[i * stream.block:(i + 1) * stream.block])
+    stream.stats.clear()
+    stream.silent_blocks = 0
+    stream.prev[:] = 0
+
+
+def tune_gpu(voice, block_s=0.3, context_s=1.0, allow_half=True, progress=None):
+    """AMD graphics cards are sometimes much faster with float32 than float16, or with
+    PyTorch's own kernels instead of MIOpen's, depending on the model. Try them all on
+    this exact card and model and keep the fastest. Returns [(label, ms per block)]."""
+    if voice.device != "cuda":
+        return []
+    h = voice.helpers
+    options = [("float16", True), ("float32", True), ("float16", False), ("float32", False)]
+    if not allow_half:
+        options = [o for o in options if o[0] == "float32"]
+    results = []
+    original = (torch.backends.cudnn.enabled, h.autocast)
+    for dtype, miopen in options:
+        torch.backends.cudnn.enabled = miopen
+        h.autocast = ("cuda", torch.float16) if dtype == "float16" else None
+        label = f"{dtype}, {'MIOpen kernels' if miopen else 'PyTorch kernels'}"
+        if progress:
+            progress(f"Tuning the graphics card: trying {label}…")
+        try:
+            stream = RVCStream(voice, block_s=block_s, context_s=context_s)
+            test = _test_voice(stream.block * 5 / stream.rate + 0.1)
+            costs = []
+            for i in range(5):
+                stream.process(test[i * stream.block:(i + 1) * stream.block])
+                costs.append(stream.last_cost)
+            cost = float(np.median(costs[2:]))  # the first blocks include kernel selection
+        except Exception as e:  # some combinations fail on some cards
+            results.append((label, None, str(e)))
+            continue
+        results.append((label, cost * 1000, ""))
+    ok = [(r, o) for r, o in zip(results, options) if r[1] is not None]
+    if ok:
+        (_label, _ms, _e), (dtype, miopen) = min(ok, key=lambda x: x[0][1])
+        torch.backends.cudnn.enabled = miopen
+        h.autocast = ("cuda", torch.float16) if dtype == "float16" else None
+    else:  # nothing worked: leave things as they were
+        torch.backends.cudnn.enabled, h.autocast = original
+    return results
 
 
 def set_threads():
