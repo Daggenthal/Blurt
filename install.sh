@@ -21,6 +21,11 @@ DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 command -v python3 >/dev/null || { echo "python3 is required."; exit 1; }
 command -v pactl >/dev/null || echo "Warning: 'pactl' not found - the virtual microphone needs it (package: libpulse / pulseaudio-utils)."
 
+PY="$APP_DIR/venv/bin/python"
+# pip with a visible progress bar for the big downloads (the AI engine is hundreds of MB)
+pip_install() { "$PY" -m pip install --progress-bar on --disable-pip-version-check "$@"; }
+step() { echo; echo "== $* =="; }
+
 mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR"
 cp "$HERE/blurt.py" "$APP_DIR/blurt.py"
 rm -rf "$APP_DIR/blurt_voice"
@@ -30,14 +35,14 @@ if [ ! -x "$APP_DIR/venv/bin/python" ]; then
     echo "Creating Python environment…"
     python3 -m venv "$APP_DIR/venv"
 fi
-echo "Installing Qt (PySide6) and numpy - this is a large download the first time…"
-"$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
-"$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade PySide6 numpy
+step "Installing Qt (PySide6) and numpy (about 200 MB the first time)"
+"$PY" -m pip install --quiet --upgrade pip
+pip_install --upgrade PySide6 numpy
 
 if [ "$AI_VOICE" = 1 ]; then
     INSTALLED=0
     if [ "$GPU" = 1 ]; then
-        echo "Installing the AI voice engine for AMD graphics cards (PyTorch ROCm, several GB)…"
+        step "Installing the AI voice engine for AMD graphics cards (PyTorch ROCm, several GB, this takes a while)"
         # A CPU build that is already installed may have a newer version number than the ROCm
         # build, and pip would then keep it. Remove it first.
         if "$APP_DIR/venv/bin/python" -c "import torch, sys; sys.exit(0 if torch.version.hip else 1)" 2>/dev/null; then
@@ -48,29 +53,30 @@ if [ "$AI_VOICE" = 1 ]; then
         fi
         for rocm in rocm7.2 rocm7.1 rocm7.0 rocm6.4 rocm6.3; do
             [ "$INSTALLED" = 1 ] && break
-            if "$APP_DIR/venv/bin/python" -m pip install --quiet --no-cache-dir torch \
-                    --index-url "https://download.pytorch.org/whl/$rocm" 2>/dev/null; then
+            echo "Trying PyTorch for $rocm…"
+            if pip_install --no-cache-dir torch --index-url "https://download.pytorch.org/whl/$rocm"; then
                 INSTALLED=1
                 echo "Installed PyTorch for $rocm."
             fi
         done
         [ "$INSTALLED" = 1 ] || echo "The ROCm build could not be installed; using the CPU build."
-        if ! id -nG | tr ' ' '\n' | grep -qxE 'render|video'; then
+        if [ -e /dev/kfd ] && { [ ! -r /dev/kfd ] || [ ! -w /dev/kfd ]; }; then
             echo "Note: the graphics card may need your user in the 'render' group:"
             echo "    sudo usermod -aG render,video $USER   (then log out and back in)"
         fi
     fi
-    [ "$INSTALLED" = 1 ] || echo "Installing the AI voice engine (PyTorch for CPU, transformers, faiss)…"
-    if [ "$INSTALLED" = 0 ] && ! "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch \
+    [ "$INSTALLED" = 1 ] || step "Installing the AI voice engine: PyTorch for CPU (about 200 MB)"
+    if [ "$INSTALLED" = 0 ] && ! pip_install --upgrade torch \
             --index-url https://download.pytorch.org/whl/cpu; then
         echo "The small CPU-only PyTorch download failed; installing the default build instead"
         echo "(this one is several GB because it includes NVIDIA libraries)."
-        "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch
+        pip_install --upgrade torch
     fi
-    "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade transformers scipy faiss-cpu
+    step "Installing transformers, scipy and faiss (about 100 MB)"
+    pip_install --upgrade transformers scipy faiss-cpu
     if [ "$GPU" = 1 ]; then
-        echo "Checking the graphics card…"
-        "$APP_DIR/venv/bin/python" - <<'PY' || true
+        step "Checking the graphics card"
+        "$PY" -W ignore - <<'PY' || true
 import os, sys
 sys.path.insert(0, os.path.expanduser(os.environ.get("XDG_DATA_HOME", "~/.local/share")) + "/blurt")
 from blurt_voice.rvc import engine
