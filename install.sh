@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Installs Blurt for the current user only (no root, nothing outside your home folder).
 # Run it from the folder that contains blurt.py:   bash install.sh
-# Add --ai-voice to also install the AI voice engine (PyTorch, about 1 GB).
+# Add --ai-voice to also install the AI voice engine (PyTorch for CPU, about 1 GB), or
+# --ai-voice-gpu for the AMD graphics card build (ROCm, several GB, much faster live voices).
 set -euo pipefail
 AI_VOICE=0
+GPU=0
 for arg in "$@"; do
     case "$arg" in
         --ai-voice) AI_VOICE=1 ;;
+        --ai-voice-gpu) AI_VOICE=1; GPU=1 ;;
         *) echo "Unknown option: $arg"; exit 1 ;;
     esac
 done
@@ -32,8 +35,25 @@ echo "Installing Qt (PySide6) and numpy - this is a large download the first tim
 "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade PySide6 numpy
 
 if [ "$AI_VOICE" = 1 ]; then
-    echo "Installing the AI voice engine (PyTorch for CPU, transformers, faiss)…"
-    if ! "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch \
+    INSTALLED=0
+    if [ "$GPU" = 1 ]; then
+        echo "Installing the AI voice engine for AMD graphics cards (PyTorch ROCm, several GB)…"
+        for rocm in rocm7.0 rocm6.4 rocm6.3; do
+            if "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch \
+                    --index-url "https://download.pytorch.org/whl/$rocm"; then
+                INSTALLED=1
+                echo "Installed PyTorch for $rocm."
+                break
+            fi
+        done
+        [ "$INSTALLED" = 1 ] || echo "The ROCm build could not be installed; using the CPU build."
+        if ! id -nG | tr ' ' '\n' | grep -qxE 'render|video'; then
+            echo "Note: the graphics card may need your user in the 'render' group:"
+            echo "    sudo usermod -aG render,video $USER   (then log out and back in)"
+        fi
+    fi
+    [ "$INSTALLED" = 1 ] || echo "Installing the AI voice engine (PyTorch for CPU, transformers, faiss)…"
+    if [ "$INSTALLED" = 0 ] && ! "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch \
             --index-url https://download.pytorch.org/whl/cpu; then
         echo "The small CPU-only PyTorch download failed; installing the default build instead"
         echo "(this one is several GB because it includes NVIDIA libraries)."

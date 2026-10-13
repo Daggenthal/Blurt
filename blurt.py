@@ -1625,11 +1625,40 @@ VOICE_RATE = 48000
 VOICE_DIR = DATA_DIR / "voices"   # models unpacked from .zip files
 AI_ASSETS = DATA_DIR / "ai"       # shared helper networks, downloaded on first use
 RESPONSIVENESS = {  # key: (label, block seconds, context seconds)
+    "auto": ("Auto (picked for this computer)", 0, 0),
     "fast": ("Fast (shorter delay, more glitches)", 0.3, 0.8),
     "balanced": ("Balanced", 0.45, 1.0),
     "smooth": ("Smooth (longer delay)", 0.7, 1.2),
 }
 TEST_SECONDS = 5
+# typical speaking pitch for each kind of voice, used to set the pitch shift automatically
+VOICE_TYPES = {
+    "high": ("High: female, anime, child", 255.0),
+    "medium": ("Medium: light male, droid, androgynous", 165.0),
+    "low": ("Low: male, deep", 115.0),
+    "same": ("Keep my own pitch", None),
+}
+HIGH_WORDS = re.compile(r"miku|teto|vocaloid|utau|girl|female|woman|anime|waifu|chan\b|"
+                        r"luka|gumi|kafu|neru|\brin\b|ariana|taylor|billie", re.I)
+LOW_WORDS = re.compile(r"\bmale\b|\bman\b|guy|deep|bass|trooper|clone|vader|grievous|"
+                       r"dooku|kenobi|anakin|mace|morgan|freeman", re.I)
+
+
+def guess_voice_type(name, gender=None):
+    if gender == "female" or HIGH_WORDS.search(name):
+        return "high"
+    if re.search(r"droid|clanker|robot|b1\b|bot\b", name, re.I):
+        return "medium"
+    if gender == "male" or LOW_WORDS.search(name):
+        return "low"
+    return "medium"
+
+
+def auto_pitch(voice_type, my_pitch):
+    target = VOICE_TYPES.get(voice_type, VOICE_TYPES["medium"])[1]
+    if not target or not my_pitch:
+        return 0
+    return int(max(-24, min(24, round(12 * np.log2(target / my_pitch)))))
 B1_DEFAULTS = {"pitch": 3, "size": 25, "metal": 60}
 
 
@@ -1763,7 +1792,7 @@ class VoiceLive:
                 self.queue.append(joined[:self.block])
                 rest = joined[self.block:]
                 pending, have = ([rest], len(rest)) if len(rest) else ([], 0)
-                while len(self.queue) > 2:  # falling behind: skip audio to keep the delay down
+                while len(self.queue) > 3:  # falling behind: skip audio to keep the delay down
                     self.queue.popleft()
                     self.dropped += 1
                 self.wake.set()
@@ -1795,7 +1824,7 @@ class VoiceDialog(QtWidgets.QDialog):
         cfg.setdefault("models", [])
         cfg.setdefault("mode", "off")
         cfg.setdefault("b1", dict(B1_DEFAULTS))
-        cfg.setdefault("responsiveness", "balanced")
+        cfg.setdefault("responsiveness", "auto")
         self.cfg = cfg
         self.live = VoiceLive()
         self.helpers = None          # shared AI helper networks, loaded once
@@ -1822,10 +1851,14 @@ class VoiceDialog(QtWidgets.QDialog):
         self.mode.setMinimumWidth(260)
         self.mode.activated.connect(lambda _i: self._mode_chosen())
         row.addWidget(self.mode, 1)
-        add = W.QPushButton("Add AI voice model…")
+        find = W.QPushButton("Find voices online…")
+        find.setToolTip("Search Hugging Face for RVC voice models and add them in one click")
+        find.clicked.connect(self.find_online)
+        add = W.QPushButton("Add from file…")
         add.clicked.connect(self.add_model)
         self.remove_btn = W.QPushButton("Remove")
         self.remove_btn.clicked.connect(self.remove_model)
+        row.addWidget(find)
         row.addWidget(add)
         row.addWidget(self.remove_btn)
         lay.addLayout(row)
@@ -1854,6 +1887,18 @@ class VoiceDialog(QtWidgets.QDialog):
         idx_btn = W.QPushButton("Choose .index file…")
         idx_btn.clicked.connect(self.choose_index)
         form.addRow("", idx_btn)
+        self.vtype = W.QComboBox()
+        for key, (label, _f) in VOICE_TYPES.items():
+            self.vtype.addItem(label, key)
+        self.vtype.activated.connect(self._vtype_changed)
+        form.addRow("This voice is:", self.vtype)
+        self.auto_box = W.QCheckBox("Set the pitch automatically from my voice")
+        self.auto_box.toggled.connect(self._auto_toggled)
+        form.addRow("", self.auto_box)
+        self.auto_info = W.QLabel("")
+        self.auto_info.setWordWrap(True)
+        form.addRow("", self.auto_info)
+        self._setting_auto = False
         self.ai_sliders = {
             "pitch": self._slider(form, "Pitch shift", -24, 24, 12, " semitones",
                                   lambda v: self._ai_changed("pitch", v)),
@@ -1868,10 +1913,14 @@ class VoiceDialog(QtWidgets.QDialog):
         self.resp.setCurrentIndex(max(0, self.resp.findData(self.cfg["responsiveness"])))
         self.resp.activated.connect(self._resp_changed)
         form.addRow("Live responsiveness:", self.resp)
-        hint = W.QLabel("<small>Pitch shift: about +12 for a deep voice to a high one, "
-                        "0 if your voice is already similar.</small>")
-        hint.setWordWrap(True)
-        form.addRow("", hint)
+        self.gpu_box = W.QCheckBox("Use the graphics card when it works (much faster)")
+        self.gpu_box.setToolTip("AMD cards need the GPU build: bash install.sh --ai-voice-gpu")
+        self.gpu_box.setChecked(self.cfg.get("use_gpu", True))
+        self.fast_box = W.QCheckBox("Fast maths (bfloat16 on newer CPUs, float16 on GPUs)")
+        self.fast_box.setChecked(self.cfg.get("fast_math", True))
+        for box, key in ((self.gpu_box, "use_gpu"), (self.fast_box, "fast_math")):
+            box.toggled.connect(lambda on, k=key: self._engine_option(k, on))
+            form.addRow("", box)
         lay.addWidget(self.ai_box)
 
         # testing
@@ -1968,11 +2017,17 @@ class VoiceDialog(QtWidgets.QDialog):
         self.remove_btn.setEnabled(model is not None)
         self.test_out = None
         if model:
+            self._setting_auto = True  # loading saved values is not a manual change
             for key, s in self.ai_sliders.items():
                 s.blockSignals(True)
                 s.setValue(int(model.get(key, {"pitch": 12, "index_rate": 75, "protect": 33}[key])))
                 s.blockSignals(False)
                 s.valueChanged.emit(s.value())
+            self.vtype.setCurrentIndex(max(0, self.vtype.findData(model.get("voice_type",
+                                                                          "medium"))))
+            self.auto_box.setChecked(model.get("auto", False))
+            self._setting_auto = False
+            self._apply_auto_pitch(model)
             index = model.get("index") or "none (the voice will be a little less accurate)"
             self.ai_files.setText(f"Model: {model['pth']}\nIndex: {index}")
             self._prepare_ai(model)
@@ -1993,19 +2048,87 @@ class VoiceDialog(QtWidgets.QDialog):
         except (OSError, ValueError, zipfile.BadZipFile) as e:
             QtWidgets.QMessageBox.warning(self, "Add voice model", str(e))
             return
-        default = Path(pth).stem.replace("_", " ").strip() or "Voice"
-        name, ok = QtWidgets.QInputDialog.getText(self, "Add voice model", "Name:",
-                                                  text=default)
-        if not ok:
-            return
+        self.register_model(pth, index, Path(pth).stem.replace("_", " ").strip() or "Voice")
+
+    def register_model(self, pth, index, default_name, gender=None, ask=True):
+        name, vtype = default_name, guess_voice_type(default_name + " " + str(pth), gender)
+        if ask:
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Add voice")
+            form = QtWidgets.QFormLayout(dlg)
+            name_edit = QtWidgets.QLineEdit(default_name)
+            name_edit.setMinimumWidth(280)
+            types = QtWidgets.QComboBox()
+            for key, (label, _f) in VOICE_TYPES.items():
+                types.addItem(label, key)
+            types.setCurrentIndex(types.findData(vtype))
+            form.addRow("Name:", name_edit)
+            form.addRow("This voice is:", types)
+            form.addRow("", QtWidgets.QLabel("<small>Used to pick the pitch shift for you. "
+                                             "You can change it later.</small>"))
+            box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok
+                                             | QtWidgets.QDialogButtonBox.Cancel)
+            box.accepted.connect(dlg.accept)
+            box.rejected.connect(dlg.reject)
+            form.addRow(box)
+            if dlg.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            name = name_edit.text().strip() or default_name
+            vtype = types.currentData()
         mid = uuid.uuid4().hex[:8]
-        self.cfg["models"].append({"id": mid, "name": name.strip() or default, "pth": pth,
-                                   "index": index, "pitch": 12, "index_rate": 75,
-                                   "protect": 33})
+        model = {"id": mid, "name": name, "pth": str(pth), "index": index or "",
+                 "voice_type": vtype, "auto": True,
+                 "pitch": auto_pitch(vtype, self.cfg.get("my_pitch")) if self.cfg.get("my_pitch")
+                 else (12 if vtype == "high" else 0),
+                 "index_rate": 75, "protect": 33}
+        self.cfg["models"].append(model)
         self.cfg["mode"] = mid
         self.store.save()
         self._fill_voices()
         self._mode_changed()
+        return model
+
+    def find_online(self):
+        dlg = getattr(self, "search_dlg", None) or VoiceSearchDialog(self)
+        self.search_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+
+    # ---- automatic settings --------------------------------------------------
+    def _vtype_changed(self, _i):
+        model = self._model()
+        if model:
+            model["voice_type"] = self.vtype.currentData()
+            self.store.save()
+            self._apply_auto_pitch(model)
+
+    def _auto_toggled(self, on):
+        model = self._model()
+        if model and not self._setting_auto:
+            model["auto"] = on
+            self.store.save()
+            self._apply_auto_pitch(model)
+
+    def _apply_auto_pitch(self, model):
+        """Pitch shift that moves your speaking pitch to where this voice normally sits."""
+        my = self.cfg.get("my_pitch")
+        vtype = model.get("voice_type", "medium")
+        if not model.get("auto", True):
+            self.auto_info.setText("")
+            return
+        if not my:
+            self.auto_info.setText("<small>Record a test once and Blurt sets the pitch for "
+                                   "you.</small>")
+            return
+        shift = auto_pitch(vtype, my)
+        target = VOICE_TYPES[vtype][1]
+        self.auto_info.setText(
+            f"<small>Your voice is about {my:.0f} Hz"
+            + (f"; this voice sits around {target:.0f} Hz, so the pitch is {shift:+d}."
+               if target else ", kept as it is.") + "</small>")
+        self._setting_auto = True
+        self.ai_sliders["pitch"].setValue(shift)
+        self._setting_auto = False
 
     def _import_model_files(self, path):
         """Returns (pth, index or ""). Zips are unpacked into Blurt's voices folder."""
@@ -2030,8 +2153,12 @@ class VoiceDialog(QtWidgets.QDialog):
         if re.match(r"^[GD]_\d+", pth.name):
             raise ValueError(f"{pth.name} is a training checkpoint, not a voice model. Use "
                              "the other, smaller .pth that came with it.")
-        indexes = sorted(folder.glob("*.index"))
-        added = [i for i in indexes if i.name.startswith("added")] or indexes
+        indexes = [i for i in sorted(folder.glob("*.index"))
+                   if not i.name.endswith(".blurt-fast.index")]
+        stem_words = set(re.findall(r"[a-z0-9]{2,}", pth.stem.lower()))
+        named = [i for i in indexes if stem_words & set(re.findall(r"[a-z0-9]{2,}",
+                                                                   i.stem.lower()))]
+        added = [i for i in (named or indexes) if i.name.startswith("added")] or named or indexes
         index = ""
         if len(added) == 1:
             index = str(added[0])
@@ -2109,9 +2236,15 @@ class VoiceDialog(QtWidgets.QDialog):
             engine.set_threads()
             if self.helpers is None:
                 progress("Starting the voice engine…")
-                self.helpers = engine.Helpers(AI_ASSETS)
-            progress(f"Loading {model['name']}…")
-            return engine.RVCVoice(self.helpers, pth, index)
+                self.helpers = engine.Helpers(
+                    AI_ASSETS, device=engine.pick_device(self.cfg.get("use_gpu", True)),
+                    fast_math=self.cfg.get("fast_math", True))
+            progress(f"Loading {model['name']}… (the first time, a big .index file can take "
+                     "a minute to prepare)")
+            voice = engine.RVCVoice(self.helpers, pth, index)
+            progress("Measuring how fast this computer runs the voice…")
+            voice.speed = engine.benchmark(voice)
+            return voice
 
         def finished(voice, error):
             self.loading = False
@@ -2121,7 +2254,13 @@ class VoiceDialog(QtWidgets.QDialog):
                 self.voices[mid] = voice
                 note = "" if voice.index is not None or not index else \
                     " (the .index file needs faiss, which is not installed, so it is skipped)"
-                self.status.setText(f"{model['name']} is ready{note}. Record a test to hear it.")
+                self.cfg["speed"] = voice.speed
+                self.store.save()
+                pick = self._auto_responsiveness()
+                self.status.setText(
+                    f"{model['name']} is ready{note}. Running on the {self.helpers.describe()} "
+                    f"at {voice.speed * 100:.0f}% of real time, so Auto live mode uses "
+                    f"“{RESPONSIVENESS[pick][0].split(' (')[0]}”. Record a test to hear it.")
                 if self.cfg["mode"] == mid:
                     self._restart_live()
             self._update_test_buttons()
@@ -2133,12 +2272,36 @@ class VoiceDialog(QtWidgets.QDialog):
         if not model:
             return
         model[key] = value
+        if key == "pitch" and not self._setting_auto and model.get("auto"):
+            model["auto"] = False
+            self._setting_auto = True
+            self.auto_box.setChecked(False)
+            self._setting_auto = False
+            self.auto_info.setText("")
         self.store.save()
         proc = self.live.processor
         if self.live.running and hasattr(proc, "shift"):
             proc.shift = model["pitch"]
             proc.index_rate = model["index_rate"] / 100
             proc.protect = model["protect"] / 100
+
+    def _engine_option(self, key, on):
+        self.cfg[key] = on
+        self.store.save()
+        if self.loading:
+            return
+        self.live.stop()
+        self.helpers = None  # rebuilt with the new option
+        self.voices.clear()
+        model = self._model()
+        if model:
+            self._prepare_ai(model)
+
+    def _auto_responsiveness(self):
+        speed = self.cfg.get("speed")
+        if not speed:
+            return "balanced"
+        return "fast" if speed < 0.4 else "balanced" if speed < 0.7 else "smooth"
 
     def _resp_changed(self, _i):
         self.cfg["responsiveness"] = self.resp.currentData()
@@ -2165,7 +2328,10 @@ class VoiceDialog(QtWidgets.QDialog):
         model = self._model()
         if model and self._ai_ready(model):
             from blurt_voice.rvc import engine
-            _label, block, context = RESPONSIVENESS[self.cfg["responsiveness"]]
+            key = self.cfg["responsiveness"]
+            if key == "auto":
+                key = self._auto_responsiveness()
+            _label, block, context = RESPONSIVENESS[key]
             stream = engine.RVCStream(self.voices[model["id"]], block_s=block, context_s=context,
                                       shift=model["pitch"], index_rate=model["index_rate"] / 100,
                                       protect=model["protect"] / 100)
@@ -2232,6 +2398,20 @@ class VoiceDialog(QtWidgets.QDialog):
             if float(np.abs(audio).max()) < 0.01:
                 self.status.setText("That was nearly silent - check the Input microphone in "
                                     "the main window.")
+            model = self._model()
+            if model and self.helpers is not None:
+                from blurt_voice.rvc import engine
+                self.status.setText("Measuring your voice…")
+
+                def measured(pitch, err):
+                    if pitch and not err:
+                        self.cfg["my_pitch"] = round(pitch, 1)
+                        self.store.save()
+                        self._apply_auto_pitch(model)
+                    self._convert_test()
+                Background(self, lambda _p: engine.voice_pitch(self.helpers, audio, VOICE_RATE),
+                           measured)
+                return
             self._convert_test()
         Background(self, work, finished)
 
@@ -2351,8 +2531,13 @@ class VoiceDialog(QtWidgets.QDialog):
         text = (f"Live ({' and '.join(where)}): about {delay:.2f} s delay, processing uses "
                 f"{self.live.cost * 100:.0f}% of real time.")
         if self.live.cost > 0.9 or self.live.dropped:
-            text += (" Your computer is struggling to keep up, so bits get skipped. Try "
-                     "“Smooth” responsiveness.")
+            key = self.cfg["responsiveness"]
+            key = self._auto_responsiveness() if key == "auto" else key
+            on_gpu = self.helpers is not None and self.helpers.device == "cuda"
+            text += " Your computer is struggling to keep up, so bits get skipped. " + (
+                "Try “Smooth” responsiveness." if key != "smooth" else
+                "Close other heavy programs" + ("." if on_gpu else
+                                               ", or use the graphics card (see the README)."))
         self.live_status.setText(text)
 
     def toggle_on_mic(self):
@@ -2365,6 +2550,166 @@ class VoiceDialog(QtWidgets.QDialog):
         self.player.stop()
         super().closeEvent(ev)
 
+
+class VoiceSearchDialog(QtWidgets.QDialog):
+    """Search Hugging Face for RVC voices; download one and add it straight to Blurt."""
+
+    def __init__(self, voice_dlg):
+        super().__init__(voice_dlg)
+        self.voice_dlg = voice_dlg
+        self.setWindowTitle("Find voices online")
+        self.resize(860, 520)
+        W = QtWidgets
+        lay = W.QVBoxLayout(self)
+        row = W.QHBoxLayout()
+        self.query = W.QLineEdit()
+        self.query.setPlaceholderText("Name of a voice (miku, teto, battle droid…) or a "
+                                      "Hugging Face link")
+        self.query.returnPressed.connect(self.search)
+        self.go = W.QPushButton("Search")
+        self.go.clicked.connect(self.search)
+        row.addWidget(self.query, 1)
+        row.addWidget(self.go)
+        lay.addLayout(row)
+        self.table = W.QTreeWidget()
+        self.table.setColumnCount(4)
+        self.table.setHeaderLabels(["Voice", "Files", "Size", "From"])
+        self.table.setRootIsDecorated(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.header().setSectionResizeMode(0, W.QHeaderView.Stretch)
+        self.table.itemDoubleClicked.connect(lambda *_: self.download())
+        lay.addWidget(self.table, 1)
+        row = W.QHBoxLayout()
+        self.status = W.QLabel("Models are made by the community. Blurt checks every model "
+                               "file before using it and refuses ones that contain code.")
+        self.status.setWordWrap(True)
+        row.addWidget(self.status, 1)
+        self.page_btn = W.QPushButton("Open page")
+        self.page_btn.clicked.connect(self.open_page)
+        self.dl_btn = W.QPushButton("Download and add")
+        self.dl_btn.setDefault(True)
+        self.dl_btn.clicked.connect(self.download)
+        folder = W.QPushButton("Open voices folder")
+        folder.clicked.connect(lambda: (VOICE_DIR.mkdir(parents=True, exist_ok=True),
+                                        show_in_file_manager(VOICE_DIR)))
+        for b in (folder, self.page_btn, self.dl_btn):
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.busy = False
+        self.results = []
+
+    @staticmethod
+    def _mb(n):
+        return f"{n / 1048576:.0f} MB" if n >= 1048576 else f"{n // 1024} KB"
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        for w in (self.go, self.dl_btn, self.query):
+            w.setEnabled(not busy)
+
+    def search(self):
+        text = self.query.text().strip()
+        if not text or self.busy:
+            return
+        from blurt_voice import hub
+        self._set_busy(True)
+        self.table.clear()
+        self.status.setText("Searching Hugging Face…")
+
+        def done(results, error):
+            self._set_busy(False)
+            if error:
+                self.status.setText(f"Search failed: {error}")
+                return
+            self.results = results
+            for e in results:
+                files = "model + index" if e["index"] else (
+                    "zip pack" if e["kind"] == "zip" else "model only")
+                size = self._mb(e["size"] + e.get("index_size", 0))
+                where = e["repo"] + (f"  ({Path(e['path']).parent})"
+                                     if str(Path(e["path"]).parent) not in (".", "") else "")
+                item = QtWidgets.QTreeWidgetItem([e["name"], files, size, where])
+                item.setToolTip(0, e["path"])
+                self.table.addTopLevelItem(item)
+            if results:
+                self.table.setCurrentItem(self.table.topLevelItem(0))
+                self.status.setText(f"Found {len(results)} voices. “model + index” usually "
+                                    "sounds best. Double-click one to add it.")
+            else:
+                self.status.setText("Nothing found. Try another spelling, or paste the link of "
+                                    "a Hugging Face page that has the model.")
+        Background(self, lambda progress: hub.search(text, progress), done, self.status.setText)
+
+    def _selected(self):
+        item = self.table.currentItem()
+        if not item:
+            return None
+        return self.results[self.table.indexOfTopLevelItem(item)]
+
+    def open_page(self):
+        e = self._selected()
+        if e:
+            folder = str(Path(e["path"]).parent)
+            url = f"https://huggingface.co/{e['repo']}/tree/main" + (
+                "/" + folder if folder not in (".", "") else "")
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def download(self):
+        e = self._selected()
+        if not e or self.busy:
+            return
+        total = e["size"] + e.get("index_size", 0)
+        if total > 700 * 1048576 and QtWidgets.QMessageBox.question(
+                self, "Large download", f"This voice is {self._mb(total)}. Download it?"
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        from blurt_voice import hub
+        safe = lambda t: re.sub(r"[^\w.-]+", "_", t).strip("_") or "voice"
+        dest = VOICE_DIR / safe(e["repo"].replace("/", "__")) / safe(e["name"])
+        self._set_busy(True)
+
+        def work(progress):
+            if e["kind"] == "zip":
+                z = hub.download(e["repo"], e["path"], dest / Path(e["path"]).name, progress)
+                return ("zip", z, None, None)
+            pth = hub.download(e["repo"], e["path"], dest / Path(e["path"]).name, progress)
+            index = None
+            if e["index"]:
+                index = hub.download(e["repo"], e["index"], dest / Path(e["index"]).name,
+                                     progress)
+            files = []
+            try:
+                files = hub.list_files(e["repo"])
+            except Exception:
+                pass
+            gender = hub.guess_gender(e["repo"], files, str(Path(e["path"]).parent))
+            return ("pth", pth, index, gender)
+
+        def done(result, error):
+            self._set_busy(False)
+            if error:
+                self.status.setText(f"Download failed: {error}")
+                return
+            kind, path, index, gender = result
+            if kind == "zip":
+                try:
+                    pth, index = self.voice_dlg._import_model_files(Path(path))
+                except (OSError, ValueError, zipfile.BadZipFile) as err:
+                    self.status.setText(f"That pack could not be used: {err}")
+                    return
+                finally:
+                    try:
+                        Path(path).unlink()
+                    except OSError:
+                        pass
+                path = pth
+            model = self.voice_dlg.register_model(path, str(index) if index else "", e["name"],
+                                                  gender)
+            if model:
+                self.status.setText(f"Added “{model['name']}”. It is selected in the Voice "
+                                    "window; record a test to hear it.")
+                self.voice_dlg.raise_()
+        Background(self, work, done, self.status.setText)
 
 ACTIONS = {"stop": "Stop", "pause": "Pause / resume", "random": "Play random sound",
            "clip": "Clip what just played", "replay_clip": "Replay last clip",

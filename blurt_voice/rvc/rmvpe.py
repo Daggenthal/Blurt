@@ -305,11 +305,12 @@ class MelSpectrogram(torch.nn.Module):
 
 
 class RMVPE:
-    def __init__(self, model_path):
-        self.mel_extractor = MelSpectrogram(128, 16000, 1024, 160, None, 30, 8000)
+    def __init__(self, model_path, device="cpu"):
+        self.device = device
+        self.mel_extractor = MelSpectrogram(128, 16000, 1024, 160, None, 30, 8000).to(device)
         model = E2E(4, 1, (2, 2))
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
-        self.model = model.eval().float()
+        self.model = model.eval().float().to(device)
         cents_mapping = 20 * np.arange(360) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))  # 368
 
@@ -323,10 +324,11 @@ class RMVPE:
 
     def infer_from_audio(self, audio, thred=0.03):
         """audio: float32 numpy at 16 kHz. Returns f0 in Hz, 100 frames per second."""
-        audio = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
-        with torch.no_grad():
+        audio = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).to(self.device)
+        device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
+        with torch.no_grad(), torch.autocast(device_type, enabled=False):  # pitch needs full precision
             mel = self.mel_extractor(audio.unsqueeze(0), center=True)
-            hidden = self.mel2hidden(mel).squeeze(0).cpu().numpy()
+            hidden = self.mel2hidden(mel).squeeze(0).float().cpu().numpy()
         cents = self.to_local_average_cents(hidden, thred=thred)
         f0 = 10 * (2 ** (cents / 1200))
         f0[f0 == 10] = 0

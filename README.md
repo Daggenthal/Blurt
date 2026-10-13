@@ -78,11 +78,20 @@ Then:
 Click **Voice** in the main window.
 
 - **B1 Battle Droid** works right away. Pitch, size and metal can be adjusted.
-- **AI voices** use RVC voice models (a `.pth` file, ideally with its `.index` file). Click **Add AI voice model**, then pick the `.pth` or the `.zip` it came in. Blurt does not include any models.
+- **AI voices** use RVC voice models (a `.pth` file, ideally with its `.index` file). Click **Find voices online** to search Hugging Face and add one in a click, or **Add from file** for a `.pth` or `.zip` you already have. Blurt does not include any models. Downloaded voices are kept in `~/.local/share/blurt/voices/`.
+- **Automatic settings:** after your first test recording, Blurt measures your voice and sets the pitch shift for the kind of voice you picked (high, medium or low). It also measures how fast your computer runs the voice and picks the live responsiveness.
 - **Test first:** press **Record 5 s test**, speak, and Blurt plays the result back only to you.
 - **Go live:** tick **Others hear this voice** to send it to Blurt-Mic. A hotkey can toggle it.
 
-AI voices run on the CPU. Live AI voices have roughly half a second to a second of delay, depending on your CPU and the responsiveness setting. Blurt loads `.pth` files in PyTorch's safe mode, which refuses files that contain code.
+AI voices run on the CPU by default. Newer CPUs with AVX-512 BF16 (for example Ryzen 7000 and later) use a faster maths mode automatically. Live AI voices have roughly half a second to a second of delay, depending on your hardware and the responsiveness setting.
+
+For much faster AI voices on an AMD graphics card, install the ROCm build instead (a download of several GB):
+
+```bash
+bash install.sh --ai-voice-gpu
+```
+
+Then tick **Use the graphics card** in the Voice window. This has not been tested on the Steam Machine's GPU yet; if it does not work, Blurt falls back to the CPU. Blurt loads `.pth` files in PyTorch's safe mode, which refuses files that contain code.
 
 ## Tested on
 

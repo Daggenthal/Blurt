@@ -18,8 +18,29 @@ from math import gcd
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
+
+
+def _rocm_override():
+    """Many consumer RDNA 3 GPUs (Steam Machine, laptops) are not on ROCm's official list but
+    run fine as gfx1100. Set the usual override before torch starts, unless the user did."""
+    if "HSA_OVERRIDE_GFX_VERSION" in os.environ:
+        return
+    try:
+        for props in Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties"):
+            for line in props.read_text().splitlines():
+                if line.startswith("gfx_target_version"):
+                    v = int(line.split()[1])
+                    if 110000 <= v < 120000 and v not in (110000, 110001, 110100):
+                        os.environ["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
+                        return
+    except (OSError, ValueError):
+        pass
+
+
+_rocm_override()
+
+import torch  # noqa: E402  (after the GPU environment is set up)
+import torch.nn.functional as F  # noqa: E402
 from scipy import signal
 
 from .models import (SynthesizerTrnMs256NSFsid, SynthesizerTrnMs256NSFsid_nono,
@@ -102,14 +123,44 @@ def resample(x, sr_from, sr_to):
     return signal.resample_poly(x, sr_to // g, sr_from // g).astype(np.float32)
 
 
+def cpu_has_bf16():
+    try:
+        flags = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return False
+    return "avx512_bf16" in flags or "amx_bf16" in flags
+
+
+def pick_device(use_gpu=True):
+    """'cuda' (NVIDIA, or AMD through ROCm) when it really works, otherwise 'cpu'."""
+    if use_gpu and torch.cuda.is_available():
+        try:
+            a = torch.randn(256, 256, device="cuda")
+            torch.cuda.synchronize()
+            if torch.isfinite(a @ a).all():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
+
 class Helpers:
     """ContentVec + RMVPE, shared by every voice model."""
 
-    def __init__(self, folder):
+    def __init__(self, folder, device="cpu", fast_math=True):
         from transformers import HubertModel
         folder = Path(folder)
+        self.device = device
+        # bfloat16 (CPU with AVX-512 BF16, e.g. Ryzen 7000/9000) or float16 (GPU) roughly
+        # halves the work with no audible difference
+        self.autocast = None
+        if fast_math and device == "cuda":
+            self.autocast = ("cuda", torch.float16)
+        elif fast_math and cpu_has_bf16():
+            self.autocast = ("cpu", torch.bfloat16)
         self.hubert = HubertModel.from_pretrained(str(folder / "contentvec"),
                                                   local_files_only=True).eval().float()
+        self.hubert.to(device)
         state = torch.load(folder / "contentvec" / "pytorch_model.bin", map_location="cpu",
                            weights_only=True)
         proj = {k.split("final_proj.", 1)[1]: v for k, v in state.items() if "final_proj." in k}
@@ -117,12 +168,25 @@ class Helpers:
         if "weight" in proj:  # only v1 models need this projection
             self.final_proj = torch.nn.Linear(proj["weight"].shape[1], proj["weight"].shape[0])
             self.final_proj.load_state_dict(proj)
-            self.final_proj.eval()
-        self.rmvpe = RMVPE(folder / "rmvpe.pt")
+            self.final_proj.eval().to(device)
+        self.rmvpe = RMVPE(folder / "rmvpe.pt", device=device)
+
+    def maths(self):
+        """Context manager for the fast-maths mode (or a no-op)."""
+        if self.autocast:
+            return torch.autocast(self.autocast[0], dtype=self.autocast[1])
+        return torch.autocast("cpu", enabled=False)
+
+    def describe(self):
+        where = "graphics card" if self.device == "cuda" else "CPU"
+        fast = {torch.float16: ", float16", torch.bfloat16: ", bfloat16"}.get(
+            self.autocast[1] if self.autocast else None, "")
+        return where + fast
 
     def features(self, audio16, version):
         x = torch.from_numpy(np.ascontiguousarray(audio16, dtype=np.float32)).view(1, -1)
-        with torch.no_grad():
+        x = x.to(self.device)
+        with torch.no_grad(), self.maths():
             if version == "v1":
                 out = self.hubert(x, output_hidden_states=True)
                 feats = out.hidden_states[9]
@@ -132,7 +196,7 @@ class Helpers:
                 feats = self.final_proj(feats)
             else:
                 feats = self.hubert(x).last_hidden_state
-        return feats
+        return feats.float()
 
 
 class RVCVoice:
@@ -161,11 +225,11 @@ class RVCVoice:
         net = cls(*config, is_half=False) if self.if_f0 else cls(*config)
         del net.enc_q
         net.load_state_dict({k: v.float() for k, v in cpt["weight"].items()}, strict=False)
-        self.net = net.eval().float()
+        self.device = helpers.device
+        self.net = net.eval().float().to(self.device)
         self.index = self.big_npy = None
         if index_path and faiss is not None and os.path.isfile(index_path):
-            self.index = faiss.read_index(str(index_path))
-            self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
+            self.index, self.big_npy = load_index(index_path)
 
     # ---- core ------------------------------------------------------------
     def _f0(self, audio16, shift, f0=None):
@@ -191,24 +255,27 @@ class RVCVoice:
         if use_protect:
             feats0 = feats.clone()
         if self.index is not None and index_rate > 0:
-            npy = feats[0].numpy()
+            npy = feats[0].cpu().numpy()
             score, ix = self.index.search(npy, k=8)
             weight = np.square(1 / np.maximum(score, 1e-9))
             weight /= weight.sum(axis=1, keepdims=True)
             npy = np.sum(self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-            feats = torch.from_numpy(npy.astype(np.float32)).unsqueeze(0) * index_rate \
+            feats = torch.from_numpy(npy.astype(np.float32)).unsqueeze(0).to(self.device) \
+                * index_rate \
                 + (1 - index_rate) * feats
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         if use_protect:
             feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         p_len = min(audio16.shape[0] // WINDOW, feats.shape[1])
         feats = feats[:, :p_len]
-        sid = torch.LongTensor([0])
-        with torch.no_grad():
+        dev = self.device
+        sid = torch.LongTensor([0]).to(dev)
+        lengths = torch.LongTensor([p_len]).to(dev)
+        with torch.no_grad(), self.helpers.maths():
             if self.if_f0:
                 coarse, f0 = self._f0(audio16, shift, f0)
-                pitch = torch.from_numpy(coarse[:p_len]).unsqueeze(0)
-                pitchf = torch.from_numpy(f0[:p_len]).unsqueeze(0)
+                pitch = torch.from_numpy(coarse[:p_len]).unsqueeze(0).to(dev)
+                pitchf = torch.from_numpy(f0[:p_len]).unsqueeze(0).to(dev)
                 if pitch.shape[1] < p_len:  # pitch track can be a frame short
                     pad = p_len - pitch.shape[1]
                     pitch = F.pad(pitch, (0, pad), value=1)
@@ -219,16 +286,15 @@ class RVCVoice:
                     mask[pitchf < 1] = protect
                     mask = mask.unsqueeze(-1)
                     feats = feats * mask + feats0[:, :p_len] * (1 - mask)
-                out = self.net.infer(feats, torch.LongTensor([p_len]), pitch, pitchf, sid,
-                                     rate=keep)[0]
+                out = self.net.infer(feats, lengths, pitch, pitchf, sid, rate=keep)[0]
             else:
-                out = self.net.infer(feats, torch.LongTensor([p_len]), sid, rate=keep)[0]
-        return out[0, 0].float().numpy()
+                out = self.net.infer(feats, lengths, sid, rate=keep)[0]
+        return out[0, 0].float().cpu().numpy()
 
     # ---- whole recordings ------------------------------------------------
     def convert(self, audio, sr, shift=0, index_rate=0.75, protect=0.33):
         """Convert a whole recording (mono float32). Returns (audio, sample_rate)."""
-        audio16 = resample(audio, sr, SR)
+        audio16 = resample(level_input(audio), sr, SR)
         audio16 = signal.filtfilt(*_HIGHPASS, audio16).astype(np.float32)
         pad = SR // 2  # half a second of reflection padding on each side
         pad_tgt = self.tgt_sr // 2
@@ -266,7 +332,7 @@ class RVCStream:
     """
 
     def __init__(self, voice, block_s=0.4, context_s=1.0, crossfade_s=0.06, sola_s=0.012,
-                 shift=0, index_rate=0.75, protect=0.33, threshold_db=-48.0, rate=48000):
+                 shift=0, index_rate=0.75, protect=0.33, threshold_db=-54.0, rate=48000):
         self.voice, self.rate = voice, rate
         self.shift, self.index_rate, self.protect = shift, index_rate, protect
         self.threshold = 10 ** (threshold_db / 20)
@@ -286,6 +352,8 @@ class RVCStream:
         self.fade_in, self.fade_out = fade, 1 - fade
         self.last_cost = 0.0
         self.lock = threading.Lock()
+        self.level = 0.0  # running loudness of speech, for automatic input gain
+        self.hold = 0     # blocks to keep converting after speech goes quiet
 
     def latency(self):
         return (self.block + self.cross) / self.rate + self.last_cost
@@ -293,12 +361,20 @@ class RVCStream:
     def process(self, block):
         """block: float32 array of exactly self.block samples at 48 kHz."""
         t0 = time.perf_counter()
-        x16 = resample(block, self.rate, SR)
+        rms = float(np.sqrt(np.mean(block ** 2)))
+        if rms >= self.threshold:  # quiet mics convert badly, so bring speech up to a steady level
+            self.level = rms if self.level == 0 else self.level + (rms - self.level) * 0.2
+        gain = min(8.0, max(1.0, TARGET_RMS / self.level)) if self.level else 1.0
+        x16 = resample(np.clip(block * gain, -1, 1), self.rate, SR)
         n = len(x16)
         self.buf16 = np.concatenate([self.buf16[n:], x16])
         frames = n // WINDOW
         self.f0_cache = np.concatenate([self.f0_cache[frames:], np.zeros(frames, np.float32)])
-        if float(np.sqrt(np.mean(block ** 2))) < self.threshold:
+        if rms >= self.threshold:
+            self.hold = max(1, int(round(0.6 * self.rate / self.block)))
+        elif self.hold > 0:
+            self.hold -= 1
+        if rms < self.threshold and self.hold == 0:
             out = np.zeros(self.block, np.float32)
             out[:self.cross] = self.prev * self.fade_out
             self.prev[:] = 0
@@ -337,6 +413,99 @@ class RVCStream:
         return np.clip(out, -1, 1)
 
 
+TARGET_RMS = 0.08
+
+
+def level_input(audio):
+    """Bring a quiet recording up to a normal speaking level (never turns loud audio down)."""
+    audio = np.asarray(audio, dtype=np.float32)
+    frames = audio[:len(audio) // 480 * 480].reshape(-1, 480) if len(audio) >= 480 else audio[None]
+    rms = np.sqrt((frames ** 2).mean(axis=1))
+    voiced = rms[rms > 10 ** (-48 / 20)]
+    if not len(voiced):
+        return audio
+    gain = min(8.0, max(1.0, TARGET_RMS / float(np.median(voiced))))
+    peak = float(np.abs(audio).max())
+    if peak * gain > 0.95:
+        gain = max(1.0, 0.95 / peak)
+    return audio * gain
+
+
+def voice_pitch(helpers, audio, sr):
+    """Median speaking pitch in Hz of a recording, or 0 if no voice was found."""
+    audio16 = resample(audio, sr, SR)
+    with torch.inference_mode():
+        f0 = helpers.rmvpe.infer_from_audio(audio16, thred=0.03)
+    voiced = f0[f0 > 0]
+    if len(voiced) <= 20:
+        return 0.0
+    pitch = float(np.median(voiced))
+    return pitch if 60 <= pitch <= 600 else 0.0  # outside human speech: don't trust it
+
+
+def benchmark(voice, block_s=0.45, context_s=1.0):
+    """Seconds of processing per second of live audio on this computer (lower is better)."""
+    stream = RVCStream(voice, block_s=block_s, context_s=context_s)
+    t = np.arange(stream.block * 3) / stream.rate
+    test = (0.1 * np.sign(np.sin(2 * np.pi * 140 * t)) * np.sin(2 * np.pi * 3 * t) ** 2
+            ).astype(np.float32)
+    costs = []
+    for i in range(3):
+        stream.process(test[i * stream.block:(i + 1) * stream.block])
+        costs.append(stream.last_cost)
+    return min(costs[1:]) / block_s
+
+
+def load_index(path):
+    """Read a .index for fast searching. Returns (index, all stored vectors).
+
+    RVC indexes are normally "IVF" indexes searched with nprobe=1, which is quick. Some
+    shared models come with a plain (flat) index of every training frame instead; searching
+    that takes over a second per live block, so Blurt builds a quick IVF copy once and keeps
+    it next to the original as <name>.blurt-fast.index.
+    """
+    index = faiss.read_index(str(path))
+    big_npy = index.reconstruct_n(0, index.ntotal)
+    try:
+        faiss.extract_index_ivf(index).nprobe = 1
+        return index, big_npy
+    except (RuntimeError, AttributeError):
+        pass  # not an IVF index
+    if index.ntotal <= 20000:
+        return index, big_npy
+    fast_path = Path(str(path) + ".blurt-fast.index")
+    try:
+        if fast_path.is_file() and fast_path.stat().st_mtime >= Path(path).stat().st_mtime:
+            fast = faiss.read_index(str(fast_path))
+            faiss.extract_index_ivf(fast).nprobe = 1
+            return fast, big_npy
+    except (RuntimeError, OSError):
+        pass
+    vecs = np.ascontiguousarray(big_npy, dtype=np.float32)
+    nlist = int(min(4096, max(64, 4 * np.sqrt(len(vecs)))))
+    quantizer = faiss.IndexFlatL2(vecs.shape[1])
+    fast = faiss.IndexIVFFlat(quantizer, vecs.shape[1], nlist)
+    rng = np.random.default_rng(0)
+    train = vecs[rng.choice(len(vecs), min(len(vecs), nlist * 40), replace=False)]
+    fast.train(train)
+    fast.add(vecs)
+    fast.nprobe = 1
+    try:
+        faiss.write_index(fast, str(fast_path))
+    except RuntimeError:
+        pass
+    return fast, big_npy
+
+
 def set_threads():
-    """Keep torch's default (one thread per physical core) and avoid slow denormal maths."""
+    """One thread per physical core for torch, and avoid slow denormal maths."""
     torch.set_flush_denormal(True)
+    try:
+        cores = len({tuple(Path(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")
+                           .read_text().strip().split(","))
+                     for c in os.sched_getaffinity(0)})
+        torch.set_num_threads(max(1, cores))
+    except (OSError, AttributeError):
+        pass
+    if faiss is not None:
+        faiss.omp_set_num_threads(1)
