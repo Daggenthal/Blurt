@@ -2513,6 +2513,8 @@ class VoiceDialog(QtWidgets.QDialog):
                 self.cfg["speed"] = voice.speed
                 self.store.save()
                 pick = self._auto_responsiveness()
+                if self.cfg.get("use_gpu", True) and self.helpers.device != "cuda":
+                    note += f" (graphics card not used: {engine.GPU_ERROR})"
                 self.status.setText(
                     f"{model['name']} is ready{note}. Running on the {self.helpers.describe()} "
                     f"at {voice.speed * 100:.0f}% of real time, so Auto live mode uses "
@@ -2931,7 +2933,8 @@ class PerfDialog(QtWidgets.QDialog):
             lines.append(f"{'Step':38s} {'average':>9s} {'worst':>9s} {'share':>7s}")
             for key, label, avg, worst, share in rows:
                 lines.append(f"{label:38s} {avg:7.0f}ms {worst:7.0f}ms {share:6.0f}%")
-            steps = [r for r in rows if r[0] != "total"]
+            # pitch runs alongside the features, so only the wait for it adds to the total
+            steps = [r for r in rows if r[0] not in ("total", "pitch")]
             total = next((r for r in rows if r[0] == "total"), None)
             if steps and total:
                 top = max(steps, key=lambda r: r[2])
@@ -2944,8 +2947,8 @@ class PerfDialog(QtWidgets.QDialog):
                                 "uses less context, which makes this step quicker.",
                     "index": "The .index search is the slowest part. Lower “Voice match” to 0 "
                              "to skip it, or try a model with a smaller index.",
-                    "pitch": "Pitch tracking is the slowest part, which is unusual. Other "
-                             "programs may be using the CPU.",
+                    "pitch_wait": "Waiting for pitch tracking is the slowest part, which is "
+                                  "unusual. Other programs may be using the CPU.",
                     "audio": "Resampling and blending is the slowest part, which is unusual. "
                              "Other programs may be using the CPU.",
                 }
@@ -2991,9 +2994,13 @@ class PerfDialog(QtWidgets.QDialog):
                     lines.append(f"  Graphics card: {torch.cuda.get_device_name(0)}")
                 except Exception:
                     pass
-            elif torch.cuda.is_available() is False and d.cfg.get("use_gpu", True):
-                lines.append("  Graphics card: not available to PyTorch (CPU build, or the "
-                             "card is not supported)")
+            else:
+                from blurt_voice.rvc import engine
+                gpu_lines, gpu_advice = engine.gpu_diagnosis()
+                lines.append("")
+                lines.append("Graphics card (why it is not used)")
+                lines += [f"  {t}" for t in gpu_lines]
+                diagnosis += gpu_advice
         if model and model["id"] in d.voices:
             v = d.voices[model["id"]]
             idx = "none"

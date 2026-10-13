@@ -31,7 +31,7 @@ def _rocm_override():
             for line in props.read_text().splitlines():
                 if line.startswith("gfx_target_version"):
                     v = int(line.split()[1])
-                    if 110000 <= v < 120000 and v not in (110000, 110001, 110100):
+                    if 110000 <= v < 120000 and v not in (110000, 110001, 110002):
                         os.environ["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
                         return
     except (OSError, ValueError):
@@ -132,17 +132,91 @@ def cpu_has_bf16():
     return "avx512_bf16" in flags or "amx_bf16" in flags
 
 
+GPU_ERROR = ""  # why the graphics card is not used, for the performance report
+
+
 def pick_device(use_gpu=True):
     """'cuda' (NVIDIA, or AMD through ROCm) when it really works, otherwise 'cpu'."""
-    if use_gpu and torch.cuda.is_available():
-        try:
-            a = torch.randn(256, 256, device="cuda")
-            torch.cuda.synchronize()
-            if torch.isfinite(a @ a).all():
-                return "cuda"
-        except Exception:
-            pass
+    global GPU_ERROR
+    GPU_ERROR = ""
+    if not use_gpu:
+        GPU_ERROR = "turned off in Blurt"
+        return "cpu"
+    if not (torch.version.hip or torch.version.cuda):
+        GPU_ERROR = "this PyTorch is the CPU-only build"
+        return "cpu"
+    if not torch.cuda.is_available():
+        GPU_ERROR = "PyTorch found no usable graphics card"
+        return "cpu"
+    try:
+        a = torch.randn(256, 256, device="cuda")
+        torch.cuda.synchronize()
+        if torch.isfinite(a @ a).all():
+            return "cuda"
+        GPU_ERROR = "the graphics card returned wrong results"
+    except Exception as e:
+        GPU_ERROR = f"the graphics card failed a test: {e}"
     return "cpu"
+
+
+def gpu_diagnosis():
+    """Everything that decides whether PyTorch can use an AMD graphics card, as text lines."""
+    import grp
+    lines, advice = [], []
+    build = "CPU only"
+    if torch.version.hip:
+        build = f"ROCm {torch.version.hip}"
+    elif torch.version.cuda:
+        build = f"CUDA {torch.version.cuda} (NVIDIA)"
+    lines.append(f"PyTorch {torch.__version__}: {build}")
+    if not torch.version.hip:
+        advice.append("Install the ROCm build: bash install.sh --ai-voice-gpu (it now removes "
+                      "the CPU build first).")
+    targets = []
+    for props in Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties"):
+        try:
+            for line in props.read_text().splitlines():
+                if line.startswith("gfx_target_version") and line.split()[1] != "0":
+                    v = int(line.split()[1])
+                    targets.append(f"gfx{v // 10000}{(v // 100) % 100:x}{v % 100:x}")
+        except (OSError, ValueError):
+            pass
+    lines.append("GPU type (ROCm): " + (", ".join(targets) or "none found"))
+    override = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
+    lines.append(f"HSA_OVERRIDE_GFX_VERSION: {override or 'not set'}")
+    kfd = Path("/dev/kfd")
+    if not kfd.exists():
+        lines.append("/dev/kfd: missing (the kernel's AMD compute driver is not available)")
+        advice.append("/dev/kfd is missing, so ROCm cannot reach the GPU on this system.")
+    else:
+        ok = os.access(kfd, os.R_OK | os.W_OK)
+        lines.append(f"/dev/kfd: {'accessible' if ok else 'no permission'}")
+        if not ok:
+            advice.append("Add yourself to the render and video groups, then log out and back "
+                          "in: sudo usermod -aG render,video $USER")
+    render = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").exists() else []
+    if render:
+        ok = all(os.access(r, os.R_OK | os.W_OK) for r in render)
+        lines.append(f"{', '.join(r.name for r in render)}: {'accessible' if ok else 'no permission'}")
+    try:
+        groups = sorted({grp.getgrgid(g).gr_name for g in os.getgroups()})
+        lines.append("Your groups: " + ", ".join(groups))
+    except (KeyError, OSError):
+        pass
+    if torch.version.hip:
+        try:
+            available = torch.cuda.is_available()
+            lines.append(f"PyTorch sees a GPU: {'yes' if available else 'no'}")
+            if available:
+                lines.append(f"GPU name: {torch.cuda.get_device_name(0)}")
+            elif targets and not override:
+                advice.append(f"Try starting Blurt with HSA_OVERRIDE_GFX_VERSION=11.0.0 "
+                              f"(your GPU reports {targets[0]}).")
+        except Exception as e:
+            lines.append(f"PyTorch GPU check failed: {e}")
+    if GPU_ERROR:
+        lines.append(f"Why the CPU is used: {GPU_ERROR}")
+    return lines, advice
 
 
 class Helpers:
@@ -234,6 +308,8 @@ class RVCVoice:
 
     # ---- core ------------------------------------------------------------
     def _f0(self, audio16, shift, f0=None):
+        if callable(f0):  # computed alongside the speech features; wait for it here
+            f0 = f0()
         if f0 is None:
             f0 = self.helpers.rmvpe.infer_from_audio(audio16, thred=0.03)
         f0 = f0 * 2 ** (shift / 12)
@@ -403,17 +479,28 @@ class RVCStream:
         audio16 = signal.lfilter(*_HIGHPASS, self.buf16).astype(np.float32)
         keep = (self.tail16 + WINDOW * 2) / len(audio16)
         prep = time.perf_counter() - t0
-        pitch_t = 0.0
+        pitch_t = [0.0]
         with self.lock:
+            f0_arg = self.f0_cache.copy()
             if self.voice.if_f0:
-                t = time.perf_counter()
                 seg = audio16[-(n + self.f0_ctx16):]
-                with torch.inference_mode():
-                    f0 = self.voice.helpers.rmvpe.infer_from_audio(seg, thred=0.03)
-                self.f0_cache[-(frames + 1):] = f0[-(frames + 1):]
-                pitch_t = time.perf_counter() - t
+
+                def track():
+                    t = time.perf_counter()
+                    with torch.inference_mode():
+                        f = self.voice.helpers.rmvpe.infer_from_audio(seg, thred=0.03)
+                    pitch_t[0] = time.perf_counter() - t
+                    return f
+                # pitch tracking and speech features don't depend on each other, so the pitch
+                # runs on a second thread while the features are computed
+                future = _pitch_pool().submit(track)
+
+                def f0_arg():
+                    f = future.result()
+                    self.f0_cache[-(frames + 1):] = f[-(frames + 1):]
+                    return self.f0_cache.copy()
             y = self.voice._infer(audio16, self.shift, self.index_rate, self.protect, keep=keep,
-                                  f0=self.f0_cache.copy())
+                                  f0=f0_arg)
             steps = dict(self.voice.times)
         t = time.perf_counter()
         y = resample(y, self.voice.tgt_sr, self.rate)
@@ -436,7 +523,8 @@ class RVCStream:
         if len(self.prev) < self.cross:
             self.prev = np.pad(self.prev, (0, self.cross - len(self.prev)))
         self.last_cost = time.perf_counter() - t0
-        steps["pitch"] = steps.get("pitch", 0.0) + pitch_t
+        steps["pitch_wait"] = steps.get("pitch", 0.0)  # time spent waiting for the pitch
+        steps["pitch"] = pitch_t[0]
         steps["audio"] = prep + (time.perf_counter() - t)
         steps["total"] = self.last_cost
         for name, value in steps.items():
@@ -447,7 +535,8 @@ class RVCStream:
     STEP_NAMES = {
         "features": "Speech features (ContentVec)",
         "index": "Voice match (.index search)",
-        "pitch": "Pitch tracking (RMVPE)",
+        "pitch": "Pitch tracking (RMVPE, in parallel)",
+        "pitch_wait": "  waiting for pitch afterwards",
         "synthesis": "Voice synthesis (the model)",
         "audio": "Resampling, level and blending",
         "total": "Total per block",
@@ -548,6 +637,17 @@ def load_index(path):
     except RuntimeError:
         pass
     return fast, big_npy
+
+
+_POOL = None
+
+
+def _pitch_pool():
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="blurt-pitch")
+    return _POOL
 
 
 def set_threads():

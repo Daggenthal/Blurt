@@ -38,12 +38,20 @@ if [ "$AI_VOICE" = 1 ]; then
     INSTALLED=0
     if [ "$GPU" = 1 ]; then
         echo "Installing the AI voice engine for AMD graphics cards (PyTorch ROCm, several GB)…"
-        for rocm in rocm7.0 rocm6.4 rocm6.3; do
-            if "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch \
-                    --index-url "https://download.pytorch.org/whl/$rocm"; then
+        # A CPU build that is already installed may have a newer version number than the ROCm
+        # build, and pip would then keep it. Remove it first.
+        if "$APP_DIR/venv/bin/python" -c "import torch, sys; sys.exit(0 if torch.version.hip else 1)" 2>/dev/null; then
+            INSTALLED=1
+            echo "PyTorch for ROCm is already installed."
+        else
+            "$APP_DIR/venv/bin/python" -m pip uninstall --quiet -y torch 2>/dev/null || true
+        fi
+        for rocm in rocm7.2 rocm7.1 rocm7.0 rocm6.4 rocm6.3; do
+            [ "$INSTALLED" = 1 ] && break
+            if "$APP_DIR/venv/bin/python" -m pip install --quiet --no-cache-dir torch \
+                    --index-url "https://download.pytorch.org/whl/$rocm" 2>/dev/null; then
                 INSTALLED=1
                 echo "Installed PyTorch for $rocm."
-                break
             fi
         done
         [ "$INSTALLED" = 1 ] || echo "The ROCm build could not be installed; using the CPU build."
@@ -60,6 +68,20 @@ if [ "$AI_VOICE" = 1 ]; then
         "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade torch
     fi
     "$APP_DIR/venv/bin/python" -m pip install --quiet --upgrade transformers scipy faiss-cpu
+    if [ "$GPU" = 1 ]; then
+        echo "Checking the graphics card…"
+        "$APP_DIR/venv/bin/python" - <<'PY' || true
+import os, sys
+sys.path.insert(0, os.path.expanduser(os.environ.get("XDG_DATA_HOME", "~/.local/share")) + "/blurt")
+from blurt_voice.rvc import engine
+device = engine.pick_device(True)
+lines, advice = engine.gpu_diagnosis()
+print("  " + "\n  ".join(lines))
+print("  Result: " + ("the graphics card works." if device == "cuda" else "Blurt will use the CPU."))
+for a in advice:
+    print("  -> " + a)
+PY
+    fi
 fi
 
 cat > "$BIN_DIR/blurt" <<EOF
