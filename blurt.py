@@ -534,15 +534,227 @@ def is_blurt_device(dev):
     return "blurt_" in device_id(dev) or dev.description().startswith("Blurt-")
 
 
-class Engine(QtCore.QObject):
+class SoundCache(QtCore.QObject):
+    """Sounds decoded once into memory (48 kHz stereo int16), so a hotkey can start one with
+    no decoding delay. Decoding runs one file at a time in the background."""
+    ready = QtCore.Signal(str)          # path
+    failed = QtCore.Signal(str, str)    # path, message
+    LIMIT = 1024 * 1048576              # bytes of decoded audio kept in memory
+
     def __init__(self):
         super().__init__()
-        self.out_mic, self.out_me = QAudioOutput(), QAudioOutput()
-        self.p_mic, self.p_me = QMediaPlayer(), QMediaPlayer()
-        self.p_mic.setAudioOutput(self.out_mic)
-        self.p_me.setAudioOutput(self.out_me)
+        self.data = {}                  # path -> (mtime, int16 array of shape (n, 2))
+        self.used = deque()             # least recently used first
+        self.size = 0
+        self.todo = deque()
+        self.decoder = None
+        self.current = None
+        self.chunks = []
+
+    def key_ok(self, path):
+        entry = self.data.get(str(path))
+        try:
+            return entry is not None and entry[0] == Path(path).stat().st_mtime
+        except OSError:
+            return False
+
+    def get(self, path):
+        path = str(path)
+        if not self.key_ok(path):
+            return None
+        try:
+            self.used.remove(path)
+        except ValueError:
+            pass
+        self.used.append(path)
+        return self.data[path][1]
+
+    def request(self, path, urgent=False):
+        path = str(path)
+        if self.key_ok(path) or path == self.current:
+            return
+        if path in self.todo:
+            if not urgent:
+                return
+            self.todo.remove(path)
+        (self.todo.appendleft if urgent else self.todo.append)(path)
+        self._next()
+
+    def _next(self):
+        if self.decoder is not None or not self.todo:
+            return
+        self.current = self.todo.popleft()
+        self.chunks = []
+        fmt = QAudioFormat()
+        fmt.setSampleRate(48000)
+        fmt.setChannelCount(2)
+        fmt.setSampleFormat(QAudioFormat.Int16)
+        self.decoder = QAudioDecoder(self)
+        self.decoder.setAudioFormat(fmt)
+        self.decoder.setSource(QtCore.QUrl.fromLocalFile(self.current))
+        self.decoder.bufferReady.connect(self._buffer)
+        self.decoder.finished.connect(self._finished)
+        self.decoder.error.connect(self._error)
+        self.decoder.start()
+
+    def _buffer(self):
+        buf = self.decoder.read()
+        if buf.isValid():
+            self.chunks.append(bytes(buf.constData())[:buf.byteCount()])
+
+    def _done(self):
+        dec, self.decoder = self.decoder, None
+        if dec is not None:
+            dec.stop()
+            dec.deleteLater()
+        path, self.current = self.current, None
+        QtCore.QTimer.singleShot(0, self._next)
+        return path
+
+    def _finished(self):
+        if self.decoder is None:
+            return
+        path = self._done()
+        pcm = np.frombuffer(b"".join(self.chunks), dtype=np.int16).reshape(-1, 2).copy()
+        self.chunks = []
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return
+        old = self.data.pop(path, None)
+        if old is not None:
+            self.size -= old[1].nbytes
+        self.data[path] = (mtime, pcm)
+        self.size += pcm.nbytes
+        if path in self.used:
+            self.used.remove(path)
+        self.used.append(path)
+        while self.size > self.LIMIT and len(self.used) > 1:
+            gone = self.used.popleft()
+            entry = self.data.pop(gone, None)
+            if entry is not None:
+                self.size -= entry[1].nbytes
+        self.ready.emit(path)
+
+    def _error(self, _e):
+        if self.decoder is None:
+            return
+        msg = self.decoder.errorString()
+        path = self._done()
+        self.failed.emit(path, msg)
+
+
+class PlayerState(QtCore.QObject):
+    """The few QMediaPlayer-style signals and getters the main window uses."""
+    positionChanged = QtCore.Signal(int)
+    durationChanged = QtCore.Signal(int)
+    playbackStateChanged = QtCore.Signal(object)
+    errorOccurred = QtCore.Signal(object, str)
+    _ended = QtCore.Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.state = QMediaPlayer.StoppedState
+        self.length_ms = 0
+
+    def playbackState(self):
+        return self.state
+
+    def duration(self):
+        return self.length_ms
+
+
+class SoundOut:
+    """One always-open playback stream (to Blurt-Mic or to your headphones) fed in 10 ms
+    pieces. Because only a few milliseconds are ever queued, a new sound starts, or cuts
+    off the old one, almost instantly."""
+    FRAME = 480  # 10 ms at 48 kHz
+
+    def __init__(self, engine, name, sink):
+        self.engine, self.name, self.sink = engine, name, sink
+        self.gain = 1.0
+        self.alive = True
+        self.proc = subprocess.Popen(
+            ["pacat", "--playback", f"--device={sink}", "--format=s16le", "--rate=48000",
+             "--channels=2", "--latency-msec=15", "--process-time-msec=5", "--raw",
+             f"--client-name=Blurt voice sound-{name}"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:  # keep the pipe tiny so nothing piles up in front of the sound server
+            fcntl.fcntl(self.proc.stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+        except OSError:
+            pass
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        e = self.engine
+        silence = np.zeros((self.FRAME, 2), np.int16).tobytes()
+        while self.alive:
+            with e.lock:
+                pcm, pos = e.pcm, e.pos.get(self.name, 0)
+                playing = e.playing and pcm is not None
+                if playing:
+                    piece = pcm[pos:pos + self.FRAME]
+                    e.pos[self.name] = pos + self.FRAME
+                    if len(piece) < self.FRAME and self.name == e.clock:
+                        e.finish()
+            if playing and len(piece):
+                out = piece.astype(np.float32) * self.gain
+                if len(out) < self.FRAME:
+                    out = np.vstack([out, np.zeros((self.FRAME - len(out), 2), np.float32)])
+                data = np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+            else:
+                data = silence
+            try:
+                self.proc.stdin.write(data)  # blocks until the server wants more
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                self.alive = False
+
+    def close(self):
+        self.alive = False
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.proc.terminate()
+
+
+class Engine(QtCore.QObject):
+    """Plays library sounds to Blurt-Mic and to your output at the same time, instantly."""
+
+    def __init__(self):
+        super().__init__()
+        self.out_mic, self.out_me = QAudioOutput(), QAudioOutput()  # hold device and volume
+        self.p_me = PlayerState()
+        self.p_me._ended.connect(self._on_end)
+        self.cache = SoundCache()
+        self.cache.ready.connect(self._decoded)
+        self.cache.failed.connect(lambda path, msg: self.p_me.errorOccurred.emit(None, msg))
+        self.lock = threading.Lock()
+        self.pcm = None
+        self.pos = {}
+        self.playing = False
+        self.clock = "me"   # the stream whose position the UI shows
+        self.outs = {}
         self.mix_ok = False
         self.current = None
+        self.pending = None  # sound waiting to be decoded before it plays
+        self.gains = {"mic": 1.0, "me": 1.0}
+        self.me_sink = "@DEFAULT_SINK@"
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(50)
+
+    # ---- streams ---------------------------------------------------------
+    def _open(self, name, sink):
+        old = self.outs.pop(name, None)
+        if old:
+            old.close()
+        if sink:
+            out = SoundOut(self, name, sink)
+            out.gain = self.gains[name]
+            self.outs[name] = out
+        self.clock = "me" if "me" in self.outs else "mic"
 
     @staticmethod
     def _gain(percent):
@@ -550,55 +762,122 @@ class Engine(QtCore.QObject):
 
     def set_mic_volume(self, percent):
         self.out_mic.setVolume(self._gain(percent))
+        self.gains["mic"] = self._gain(percent)
+        if "mic" in self.outs:
+            self.outs["mic"].gain = self.gains["mic"]
 
     def set_my_volume(self, percent):
         self.out_me.setVolume(self._gain(percent))
+        self.gains["me"] = self._gain(percent)
+        if "me" in self.outs:
+            self.outs["me"].gain = self.gains["me"]
 
     def find_mix(self):
         for dev in QMediaDevices.audioOutputs():
             if is_mix_device(dev):
                 self.out_mic.setDevice(dev)
+                if not self.mix_ok or "mic" not in self.outs:
+                    self._open("mic", MIX_SINK)
                 self.mix_ok = True
                 return True
         self.mix_ok = False
+        self._open("mic", None)
         return False
 
     def set_output(self, dev):
         self.out_me.setDevice(dev)
+        sink = device_id(dev) or "@DEFAULT_SINK@"
+        if sink != self.me_sink or "me" not in self.outs or not self.outs["me"].alive:
+            self.me_sink = sink
+            self._open("me", sink)
+
+    def close(self):
+        for name in list(self.outs):
+            self._open(name, None)
+
+    # ---- playback --------------------------------------------------------
+    def preload(self, path):
+        self.cache.request(path)
 
     def play(self, sound_id, path):
-        self.stop()
-        url = QtCore.QUrl.fromLocalFile(str(path))
+        """Start a sound from the beginning, cutting off whatever is playing."""
         self.current = sound_id
-        self.p_me.setSource(url)
-        self.p_me.play()
-        if self.mix_ok:  # never fall back to the default device: you'd hear it twice
-            self.p_mic.setSource(url)
-            self.p_mic.play()
+        pcm = self.cache.get(path)
+        if pcm is None:  # not decoded yet: play as soon as it is (first time only)
+            self.pending = str(path)
+            self.cache.request(path, urgent=True)
+            return
+        self.pending = None
+        self._start(pcm)
+
+    def _decoded(self, path):
+        if path == self.pending:
+            self.pending = None
+            pcm = self.cache.get(path)
+            if pcm is not None:
+                self._start(pcm)
+
+    def _start(self, pcm):
+        with self.lock:
+            self.pcm = pcm
+            self.pos = {name: 0 for name in ("me", "mic")}
+            self.playing = True
+        self.p_me.length_ms = len(pcm) * 1000 // 48000
+        self.p_me.durationChanged.emit(self.p_me.length_ms)
+        self._set_state(QMediaPlayer.PlayingState)
+
+    def finish(self):
+        """Called with the lock held, from a stream thread, when the sound has played out."""
+        self.playing = False
+        self.p_me._ended.emit(0)
+
+    def _on_end(self, _):
+        if not self.playing:
+            self.pcm = None
+            self._set_state(QMediaPlayer.StoppedState)
+
+    def _set_state(self, state):
+        if self.p_me.state != state:
+            self.p_me.state = state
+            self.p_me.playbackStateChanged.emit(state)
 
     def toggle_pause(self):
-        if self.p_me.playbackState() == QMediaPlayer.PlayingState:
-            self.p_me.pause()
-            self.p_mic.pause()
-        elif self.p_me.playbackState() == QMediaPlayer.PausedState:
-            self.p_me.play()
-            if self.mix_ok:
-                self.p_mic.play()
+        if self.p_me.state == QMediaPlayer.PlayingState:
+            with self.lock:
+                self.playing = False
+            self._set_state(QMediaPlayer.PausedState)
+        elif self.p_me.state == QMediaPlayer.PausedState and self.pcm is not None:
+            with self.lock:
+                # both streams carry on from the same point
+                p = self.pos.get(self.clock, 0)
+                self.pos = {name: p for name in ("me", "mic")}
+                self.playing = True
+            self._set_state(QMediaPlayer.PlayingState)
 
     def stop(self):
-        self.p_me.stop()
-        self.p_mic.stop()
+        self.pending = None
+        with self.lock:
+            self.playing = False
+            self.pcm = None
+        self._set_state(QMediaPlayer.StoppedState)
+        self.p_me.positionChanged.emit(0)
 
     def forget(self):
         """Stop and let go of the current file (it is about to be changed on disk)."""
         self.stop()
-        self.p_me.setSource(QtCore.QUrl())
-        self.p_mic.setSource(QtCore.QUrl())
         self.current = None
 
     def seek(self, ms):
-        self.p_me.setPosition(ms)
-        self.p_mic.setPosition(ms)
+        with self.lock:
+            p = int(ms * 48000 / 1000)
+            self.pos = {name: p for name in ("me", "mic")}
+
+    def position(self):
+        return self.pos.get(self.clock, 0) * 1000 // 48000
+
+    def _tick(self):
+        if self.p_me.state == QMediaPlayer.PlayingState:
+            self.p_me.positionChanged.emit(min(self.position(), self.p_me.length_ms))
 
 
 # --------------------------------------------------------------------------
@@ -3989,7 +4268,17 @@ class MainWindow(QtWidgets.QMainWindow):
         return [s for s in self.store.sounds
                 if (not fid or s.get("folder") == fid) and text in s["name"].lower()]
 
+    def preload_library(self):
+        """Decode every sound into memory in the background, hotkeyed ones first, so they
+        start instantly when pressed."""
+        sounds = sorted(self.store.sounds, key=lambda s: not s.get("hotkey"))
+        for snd in sounds:
+            path = self.store.path_of(snd)
+            if path.exists():
+                self.engine.preload(path)
+
     def refresh_sounds(self):
+        QtCore.QTimer.singleShot(0, self.preload_library)
         t = self.table
         t.setSortingEnabled(False)
         t.setRowCount(0)
@@ -4413,6 +4702,7 @@ def main():
     app.aboutToQuit.connect(win.clipper.stop)
     app.aboutToQuit.connect(win.tee.stop)
     app.aboutToQuit.connect(win.shutdown_voice)
+    app.aboutToQuit.connect(engine.close)
     atexit.register(win.tee.stop)
     app.aboutToQuit.connect(router.teardown)
     signal.signal(signal.SIGINT, lambda *_: app.quit())
