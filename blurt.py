@@ -966,6 +966,9 @@ class Store:
         if p.suffix.lower() not in AUDIO_EXTS or not p.is_file():
             return False
         src = str(p.resolve())
+        ignored = self.settings.get("ignored", [])
+        if src in ignored:  # importing it again on purpose brings it back
+            ignored.remove(src)
         if any(s.get("src") == src for s in self.sounds):
             return False  # already imported
         sid = uuid.uuid4().hex[:12]
@@ -978,22 +981,85 @@ class Store:
                             "folder": folder_id, "hotkey": ""})
         return True
 
-    def import_dir(self, root):
+    def import_dir(self, root, remember=True):
         """Import a directory tree; each directory with audio becomes a folder."""
         root = os.path.abspath(root)
+        if remember:
+            self.watch(root)
         count = 0
         for dirpath, dirs, files in os.walk(root):
             dirs.sort()
             audio = sorted(f for f in files if Path(f).suffix.lower() in AUDIO_EXTS)
             if not audio:
                 continue
+            ignored = set(self.settings.get("ignored", [])) if not remember else set()
+            audio = [f for f in audio
+                     if str(Path(dirpath, f).resolve()) not in ignored]
+            if not audio:
+                continue
             fid = self.folder_by_name(os.path.relpath(dirpath, os.path.dirname(root)))
             count += sum(self.import_file(os.path.join(dirpath, f), fid) for f in audio)
         return count
 
+    def watch(self, root):
+        """Remember an imported folder so Refresh picks up files added to it later."""
+        root = os.path.abspath(root)
+        watched = self.settings.setdefault("watched", [])
+        if root not in watched:
+            watched.append(root)
+
+    def refresh(self):
+        """Pick up changes made outside Blurt. Returns (added, removed).
+
+        * audio files copied into Blurt's own sounds folder (or its subfolders) are added
+          where they are, in the matching folder
+        * new files in folders imported with "Import folder" are imported
+        * sounds whose file was deleted from Blurt's sounds folder are removed
+        """
+        added = removed = 0
+        for snd in list(self.sounds):
+            if not self.path_of(snd).is_file():
+                self._forget_source(snd)
+                self.sounds.remove(snd)
+                removed += 1
+        known = {self.path_of(s_).resolve() for s_ in self.sounds}
+        dir_to_folder = {self.folder_dir(f["id"]).resolve(): f["id"] for f in self.folders}
+        for dirpath, dirs, files in os.walk(SOUNDS_DIR):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for name in sorted(files):
+                path = Path(dirpath) / name
+                if name.startswith(".") or path.suffix.lower() not in AUDIO_EXTS:
+                    continue
+                if path.resolve() in known:
+                    continue
+                folder_dir = Path(dirpath).resolve()
+                fid = None
+                if folder_dir != SOUNDS_DIR.resolve():
+                    fid = dir_to_folder.get(folder_dir)
+                    if fid is None:
+                        fid = self.folder_by_name(str(folder_dir.relative_to(SOUNDS_DIR.resolve())))
+                        dir_to_folder[folder_dir] = fid
+                self.sounds.append({"id": uuid.uuid4().hex[:12], "name": path.stem,
+                                    "file": str(path.relative_to(SOUNDS_DIR)), "src": "",
+                                    "folder": fid, "hotkey": ""})
+                known.add(path.resolve())
+                added += 1
+        for root in self.settings.get("watched", []):
+            if os.path.isdir(root):
+                added += self.import_dir(root, remember=False)
+        return added, removed
+
+    def _forget_source(self, snd):
+        """A sound the user removed should not come back on the next Refresh."""
+        if snd.get("src"):
+            ignored = self.settings.setdefault("ignored", [])
+            if snd["src"] not in ignored:
+                ignored.append(snd["src"])
+
     def remove_sound(self, sid):
         s = self.sound(sid)
         if s:
+            self._forget_source(s)
             try:
                 self.path_of(s).unlink()
             except OSError:
@@ -3885,10 +3951,17 @@ class MainWindow(QtWidgets.QMainWindow):
         top = W.QHBoxLayout()
         for text, slot in (("Import files…", self.import_files),
                            ("Import folder…", self.import_folder),
-                           ("New folder", self.new_folder)):
+                           ("New folder", self.new_folder),
+                           ("⟳ Refresh", self.refresh_library)):
             b = W.QPushButton(text)
             b.clicked.connect(slot)
             top.addWidget(b)
+            if slot == self.refresh_library:
+                b.setToolTip("Pick up audio files added to Blurt's sounds folder or to folders "
+                             "you imported, without restarting (F5). Also happens "
+                             "automatically when you switch back to Blurt.")
+        QtGui.QShortcut(QtGui.QKeySequence("F5"), self, activated=self.refresh_library)
+        QtWidgets.QApplication.instance().applicationStateChanged.connect(self._app_state)
         self.voice_btn = W.QPushButton("🎙 Voice…")
         self.voice_btn.setToolTip("Voice changer: B1 Battle Droid and AI voices on your mic")
         self.voice_btn.clicked.connect(self.open_voice)
@@ -4381,6 +4454,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Import audio files", str(Path.home()), f"Audio ({exts});;All files (*)")
         fid = self.current_folder()
         self._imported(sum(self.store.import_file(f, fid) for f in files))
+
+    def refresh_library(self, quiet=False):
+        added, removed = self.store.refresh()
+        if added or removed:
+            self.store.save()
+            self.rebuild_hotkeys()
+            self.refresh_folders()
+        if added or removed or not quiet:
+            parts = []
+            if added:
+                parts.append(f"added {added} new sound" + ("s" if added != 1 else ""))
+            if removed:
+                parts.append(f"removed {removed} missing sound" + ("s" if removed != 1 else ""))
+            self.statusBar().showMessage(
+                ("Refreshed: " + ", ".join(parts) + ".") if parts else "Nothing new found.", 5000)
+
+    def _app_state(self, state):
+        if state == Qt.ApplicationActive:
+            QtCore.QTimer.singleShot(200, lambda: self.refresh_library(quiet=True))
 
     def import_folder(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Import folder", str(Path.home()))

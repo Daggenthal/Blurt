@@ -20,6 +20,7 @@ While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick t
 - **Effects:** noise reduction, click removal, noise gate, amplify, normalize, fades, reverse, silence, repeat, speed, pitch, echo, reverb, bass boost, distortion, telephone and robot. Each one can be previewed before it is applied.
 - **Noise gate:** mutes your mic between words so breaths, typing and background noise are not heard. Toggle it in the main window or with a hotkey, and set the threshold with the live level meter.
 - **Voice changer:** change your live mic voice. Includes a B1 Battle Droid voice, and AI voices from any RVC model you download (for example Miku or Teto). Record a test (5 to 30 seconds) to hear the result privately before anyone else hears it, or turn on "Hear myself live".
+- **Refresh:** press **Refresh** (or F5) to pick up new audio files without restarting: files copied into Blurt's sounds folder, and new files in folders you imported. Blurt also checks whenever you switch back to its window.
 - **Real files:** your library is stored as normal files in `~/.local/share/blurt/sounds/`, in folders that match the ones in the app.
 
 ![Editor](screenshots/editor.png)
