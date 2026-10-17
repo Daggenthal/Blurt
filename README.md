@@ -27,7 +27,7 @@ While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick t
 ## Requirements
 
 - Linux with PipeWire (with `pipewire-pulse`) or PulseAudio
-- Python 3 with `venv`
+- `curl` or `wget` (the installer downloads its own Python, so the system Python is not needed)
 - `pactl` and `parec` (part of `libpulse` or `pulseaudio-utils`)
 - `pw-dump` and `pw-link` (part of PipeWire) to keep Blurt's own playback out of clips
 - For AI voices only: about 1 GB for PyTorch, plus a one time 560 MB download of two helper files. A recent multi-core CPU is needed for live AI voices.
@@ -42,7 +42,7 @@ cd blurt
 bash install.sh
 ```
 
-The installer needs no root. It puts everything in your home folder: a Python environment with PySide6 and numpy in `~/.local/share/blurt/`, a launcher in `~/.local/bin/blurt`, and a menu entry.
+The installer needs no root. It puts everything in your home folder: its own Python (via [uv](https://github.com/astral-sh/uv)) with PySide6 and numpy in `~/.local/share/blurt/`, a launcher in `~/.local/bin/blurt`, and a menu entry. Because Blurt brings its own Python, SteamOS updates (including beta branches) cannot break it by changing the system Python. If anything ever does break, starting Blurt offers to repair itself.
 
 To also enable AI voices, run the installer with `--ai-voice` instead:
 
