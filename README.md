@@ -19,7 +19,7 @@ While Blurt is open it creates a virtual microphone called **Blurt-Mic**. Pick t
 - **Editor:** a waveform view where you select, trim, cut, zoom and undo, with a preview that only you hear.
 - **Effects:** noise reduction, click removal, noise gate, amplify, normalize, fades, reverse, silence, repeat, speed, pitch, echo, reverb, bass boost, distortion, telephone and robot. Each one can be previewed before it is applied.
 - **Noise gate:** mutes your mic between words so breaths, typing and background noise are not heard. Toggle it in the main window or with a hotkey, and set the threshold with the live level meter.
-- **Voice changer:** change your live mic voice. Includes a B1 Battle Droid voice, and AI voices from any RVC model you download (for example Miku or Teto). Record a 5 second test to hear the result privately before anyone else hears it, or turn on "Hear myself live".
+- **Voice changer:** change your live mic voice. Includes a B1 Battle Droid voice, and AI voices from any RVC model you download (for example Miku or Teto). Record a test (5 to 30 seconds) to hear the result privately before anyone else hears it, or turn on "Hear myself live".
 - **Real files:** your library is stored as normal files in `~/.local/share/blurt/sounds/`, in folders that match the ones in the app.
 
 ![Editor](screenshots/editor.png)
@@ -83,7 +83,7 @@ Click **Voice** in the main window.
 - **Loudness:** each voice has an output boost, and "Even out loudness" brings quiet voice models up to a normal talking level, with a soft limiter so it never clips.
 - **Saved settings:** each voice remembers its own settings. **Save settings as** keeps named versions (for example "talking" and "singing"), with a backup next to the model file, so they come back even if the voice is removed and added again.
 - **Automatic settings:** after your first test recording, Blurt measures your voice and sets the pitch shift for the kind of voice you picked (high, medium or low). It also measures how fast your computer runs the voice and picks the live responsiveness.
-- **Test first:** press **Record 5 s test**, speak, and Blurt plays the result back only to you.
+- **Test first:** press **Record test**, speak, then press **Play with voice** to hear the result (only you hear it).
 - **Go live:** tick **Others hear this voice** to send it to Blurt-Mic. A hotkey can toggle it.
 
 If the live AI voice skips, **Performance details** in the Voice window shows which step takes the time (speech features, index search, pitch tracking or the model itself), along with CPU speed, system load and model details. It can copy or save a report, and also writes one to `~/.local/share/blurt/voice-performance.log` every 15 seconds.

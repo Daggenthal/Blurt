@@ -1911,7 +1911,7 @@ RESPONSIVENESS = {  # key: (label, block seconds, context seconds)
     "balanced": ("Balanced", 0.45, 1.0),
     "smooth": ("Smooth (longer delay)", 0.7, 1.2),
 }
-TEST_SECONDS = 5
+TEST_SECONDS = 10
 # typical speaking pitch for each kind of voice, used to set the pitch shift automatically
 VOICE_TYPES = {
     "high": ("High: female, anime, child", 255.0),
@@ -2409,12 +2409,23 @@ class VoiceDialog(QtWidgets.QDialog):
         lay.addWidget(self.ai_box)
 
         # testing
-        test = W.QGroupBox(f"Test - record {TEST_SECONDS} seconds and hear the result "
-                           "(nobody else hears it)")
+        test = W.QGroupBox("Test - record yourself and hear the result (nobody else hears it)")
         tl = W.QVBoxLayout(test)
         trow = W.QHBoxLayout()
-        self.rec_btn = W.QPushButton(f"● Record {TEST_SECONDS} s test")
+        self.test_len = W.QComboBox()
+        for secs in (5, 10, 15, 20, 30):
+            self.test_len.addItem(f"{secs} s", secs)
+        self.test_len.setCurrentIndex(max(0, self.test_len.findData(
+            int(self.cfg.get("test_seconds", 10)))))
+        self.test_len.setToolTip("Length of the test recording")
+        self.test_len.activated.connect(self._test_len_changed)
+        self.rec_btn = W.QPushButton()
+        self._test_len_changed()
         self.rec_btn.clicked.connect(self.record_test)
+        self.autoplay = W.QCheckBox("Play automatically")
+        self.autoplay.setChecked(bool(self.cfg.get("test_autoplay", False)))
+        self.autoplay.toggled.connect(lambda on: (self.cfg.__setitem__("test_autoplay", on),
+                                                  self.store.save()))
         self.play_btn = W.QPushButton("▶ Play with voice")
         self.play_btn.clicked.connect(lambda: self._play_test(self.test_out))
         self.orig_btn = W.QPushButton("▶ Play original")
@@ -2425,7 +2436,8 @@ class VoiceDialog(QtWidgets.QDialog):
         self.redo_btn.clicked.connect(self._convert_test)
         self.save_test_btn = W.QPushButton("Save to library…")
         self.save_test_btn.clicked.connect(self.save_test)
-        for b in (self.rec_btn, self.play_btn, self.orig_btn, self.redo_btn, self.save_test_btn):
+        for b in (self.test_len, self.rec_btn, self.play_btn, self.orig_btn, self.redo_btn,
+                  self.save_test_btn, self.autoplay):
             trow.addWidget(b)
         trow.addStretch(1)
         tl.addLayout(trow)
@@ -3125,7 +3137,7 @@ class VoiceDialog(QtWidgets.QDialog):
         self.recording = True
         self._update_test_buttons()
         self.player.stop()
-        self._countdown = TEST_SECONDS
+        self._countdown = seconds = self.test_seconds()
         self.status.setText(f"Recording… speak now ({self._countdown} s)")
         tick = QtCore.QTimer(self)
 
@@ -3144,7 +3156,7 @@ class VoiceDialog(QtWidgets.QDialog):
                  "--channels=1", "--latency-msec=20", "--raw",
                  "--client-name=Blurt voice test"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            want = TEST_SECONDS * VOICE_RATE * 4
+            want = seconds * VOICE_RATE * 4
             data = b""
             try:
                 while len(data) < want:
@@ -3195,9 +3207,10 @@ class VoiceDialog(QtWidgets.QDialog):
             src = np.concatenate([source, pad])
             out = np.concatenate([b1.process(src[i:i + 480]) for i in range(0, len(src), 480)])
             self.test_out = self._leveled(out[b1.latency:b1.latency + len(self.test_raw)])
-            self.status.setText("Done. Press “Play with voice”.")
+            self.status.setText("Done. Press “Play with voice” to hear it.")
             self._update_test_buttons()
-            self._play_test(self.test_out)
+            if self.autoplay.isChecked():
+                self._play_test(self.test_out)
             return
         if not self._ai_ready(model):
             return
@@ -3219,8 +3232,12 @@ class VoiceDialog(QtWidgets.QDialog):
             else:
                 self.test_out = out = self._leveled(out)
                 took = time.perf_counter() - started
-                self.status.setText(f"Done in {took:.1f} s. Playing it now.")
-                self._play_test(out)
+                if self.autoplay.isChecked():
+                    self.status.setText(f"Done in {took:.1f} s. Playing it now.")
+                    self._play_test(out)
+                else:
+                    self.status.setText(f"Done in {took:.1f} s. Press “Play with voice” to "
+                                        "hear it.")
             self._update_test_buttons()
         Background(self, work, finished)
 
@@ -3233,6 +3250,14 @@ class VoiceDialog(QtWidgets.QDialog):
         step = 7680
         return np.concatenate([level.process(audio[i:i + step])
                                for i in range(0, len(audio), step)]) if len(audio) else audio
+
+    def test_seconds(self):
+        return int(self.test_len.currentData() or TEST_SECONDS)
+
+    def _test_len_changed(self, *_):
+        self.cfg["test_seconds"] = self.test_seconds()
+        self.store.save()
+        self.rec_btn.setText(f"● Record {self.test_seconds()} s test")
 
     def _play_test(self, audio):
         if audio is None:
