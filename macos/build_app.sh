@@ -187,7 +187,13 @@ rm -rf "$STAGE" "$DMG"
 mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Blurt.app"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -quiet -volname Blurt -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+# (hdiutil sometimes fails with "Resource busy", e.g. on GitHub's machines: try again)
+for attempt in 1 2 3 4 5; do
+    hdiutil create -volname Blurt -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null && break
+    [ "$attempt" = 5 ] && { echo "Could not create the disk image"; exit 1; }
+    echo "hdiutil failed; trying again ($attempt)"
+    sleep $((attempt * 3))
+done
 rm -rf "$STAGE"
 if [ -n "${NOTARY_PROFILE:-}" ]; then
     codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG"
