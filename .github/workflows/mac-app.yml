@@ -44,6 +44,8 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KC" >/dev/null
+          # codesign looks the key up through the search list, so add the keychain to it
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           # (a self-signed certificate is not "valid" to macOS, so no -v here; codesign
           # still signs with it)
           ID="$(security find-identity -p codesigning "$KC" | awk '/\)/{print $2; exit}')"
