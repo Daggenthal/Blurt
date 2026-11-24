@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <libproc.h>
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140200
 #import <CoreAudio/AudioHardwareTapping.h>
@@ -165,6 +166,11 @@ static AudioObjectID device_for_uid(const char *uid) {
     OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof s, &s, &size, &dev);
     CFRelease(s);
     return st == noErr ? dev : kAudioObjectUnknown;
+}
+
+// 1 if a device with this UID exists, hidden ones included.
+EXPORT int ba_device_exists(const char *uid) {
+    return device_for_uid(uid) != kAudioObjectUnknown;
 }
 
 // JSON: {"devices": [{"uid", "name", "inputs", "outputs", "rate"}...],
@@ -753,72 +759,182 @@ static OSStatus tap_io(AudioObjectID dev, const AudioTimeStamp *now, const Audio
 }
 #endif
 
+#if HAVE_TAPS
+// Starts a tap and its private aggregate device: what the Mac plays except `exclude_pid`
+// (include = NULL), or only what the processes in `include` play. NULL on failure.
+static BAIn *tap_in_open(const int *include, int n_include, int exclude_pid, double rate,
+                         int channels, int s16) API_AVAILABLE(macos(14.2)) {
+    BAIn *in = calloc(1, sizeof *in);
+    in->fd = -1;
+    in->ch = channels == 1 ? 1 : 2;
+    in->rate = rate;
+    in->s16 = s16;
+    atomic_store(&in->alive, 1);
+    OSStatus st;
+    NSString *what = include ? @"the relay" : @"the clip recorder";
+    @autoreleasepool {
+        CATapDescription *desc;
+        if (include) {
+            NSMutableArray *objs = [NSMutableArray array];
+            for (int i = 0; i < n_include; i++) {
+                AudioObjectID o = process_object(include[i]);
+                if (o != kAudioObjectUnknown) [objs addObject:@(o)];
+            }
+            if (objs.count == 0) {
+                set_error(@"That app is not playing any sound right now", 0);
+                free(in);
+                return NULL;
+            }
+            in->excluded = 1;  // nothing to exclude
+            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:objs];
+            desc.name = @"Blurt relay";
+        } else {
+            in->exclude_pid = exclude_pid;
+            AudioObjectID me = exclude_pid > 0 ? process_object(exclude_pid) : kAudioObjectUnknown;
+            NSArray *exclude = me != kAudioObjectUnknown ? @[@(me)] : @[];
+            in->excluded = me != kAudioObjectUnknown || exclude_pid <= 0;
+            desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:exclude];
+            desc.name = @"Blurt clip buffer";
+        }
+        desc.privateTap = YES;
+        desc.muteBehavior = CATapUnmuted;
+        st = AudioHardwareCreateProcessTap(desc, &in->tap);
+        if (st) { set_error(@"Could not record what the Mac plays", st); ba_in_close(in); return NULL; }
+        AudioObjectPropertyAddress fa = {kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMain};
+        AudioStreamBasicDescription tf = {0};
+        UInt32 size = sizeof tf;
+        AudioObjectGetPropertyData(in->tap, &fa, 0, NULL, &size, &tf);
+        in->src_rate = tf.mSampleRate > 0 ? tf.mSampleRate : 48000;
+        in->src_ch = tf.mChannelsPerFrame ? tf.mChannelsPerFrame : 2;
+        AudioObjectID out_dev = default_device(0);
+        NSString *out_uid = out_dev ? device_string(out_dev, kAudioDevicePropertyDeviceUID) : nil;
+        NSMutableDictionary *agg = [@{
+            @kAudioAggregateDeviceNameKey: desc.name,
+            @kAudioAggregateDeviceUIDKey: [NSUUID UUID].UUIDString,
+            @kAudioAggregateDeviceIsPrivateKey: @YES,
+            @kAudioAggregateDeviceIsStackedKey: @NO,
+            @kAudioAggregateDeviceTapAutoStartKey: @YES,
+            @kAudioAggregateDeviceTapListKey: @[@{
+                @kAudioSubTapDriftCompensationKey: @YES,
+                @kAudioSubTapUIDKey: desc.UUID.UUIDString,
+            }],
+        } mutableCopy];
+        if (out_uid.length) {
+            agg[@kAudioAggregateDeviceMainSubDeviceKey] = out_uid;
+            agg[@kAudioAggregateDeviceSubDeviceListKey] = @[@{@kAudioSubDeviceUIDKey: out_uid}];
+        }
+        st = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg, &in->agg);
+    }
+    if (st) {
+        set_error([NSString stringWithFormat:@"Could not create %@", what], st);
+        ba_in_close(in);
+        return NULL;
+    }
+    // The tap's audio arrives at the aggregate device's rate, which follows the output
+    // device (44.1 kHz for many headphones), not necessarily the tap's own format.
+    Float64 agg_rate = device_rate(in->agg);
+    if (agg_rate > 0) in->src_rate = agg_rate;
+    if (AudioObjectAddPropertyListener(in->agg, &kRateAddr, setup_changed, &in->alive) == noErr)
+        in->rate_dev = in->agg;
+    AudioObjectPropertyAddress sys = kDefaultOutAddr;
+    if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &sys, setup_changed, &in->alive) == noErr)
+        in->watch_default_out = 1;
+    if (!in_finish_setup(in, 0.5)) { set_error(@"Could not set up audio conversion", 0); ba_in_close(in); return NULL; }
+    st = AudioDeviceCreateIOProcID(in->agg, tap_io, in, &in->proc);
+    if (!st) st = AudioDeviceStart(in->agg, in->proc);
+    if (st) {
+        set_error([NSString stringWithFormat:@"Could not start %@", what], st);
+        ba_in_close(in);
+        return NULL;
+    }
+    return in;
+}
+#endif
+
+// JSON: the processes Core Audio knows (those that have played or recorded sound), each as
+// {"pid", "app", "bundle", "out": playing now, "in": recording now, "inputs": [device uids]}.
+// "app" and "bundle" are those of the outermost .app the program lives in, so helper
+// processes (e.g. "Discord Helper (Renderer)") count as their app ("Discord").
+EXPORT char *ba_procs_json(void) {
+    @autoreleasepool {
+        NSMutableArray *list = [NSMutableArray array];
+#if HAVE_TAPS
+        if (@available(macOS 14.2, *)) {
+            AudioObjectPropertyAddress la = {kAudioHardwarePropertyProcessObjectList,
+                                             kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            UInt32 size = 0;
+            if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &la, 0, NULL, &size) == noErr && size) {
+                UInt32 n = size / sizeof(AudioObjectID);
+                AudioObjectID *objs = calloc(n, sizeof(AudioObjectID));
+                AudioObjectGetPropertyData(kAudioObjectSystemObject, &la, 0, NULL, &size, objs);
+                for (UInt32 i = 0; i < n; i++) {
+                    pid_t pid = -1;
+                    UInt32 out = 0, inp = 0, sz = sizeof pid;
+                    AudioObjectPropertyAddress a = {kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal,
+                                                    kAudioObjectPropertyElementMain};
+                    if (AudioObjectGetPropertyData(objs[i], &a, 0, NULL, &sz, &pid) != noErr || pid <= 0)
+                        continue;
+                    a.mSelector = kAudioProcessPropertyIsRunningOutput;
+                    sz = sizeof out;
+                    AudioObjectGetPropertyData(objs[i], &a, 0, NULL, &sz, &out);
+                    a.mSelector = kAudioProcessPropertyIsRunningInput;
+                    sz = sizeof inp;
+                    AudioObjectGetPropertyData(objs[i], &a, 0, NULL, &sz, &inp);
+                    NSMutableArray *inputs = [NSMutableArray array];
+                    AudioObjectPropertyAddress da = {kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput,
+                                                     kAudioObjectPropertyElementMain};
+                    if (AudioObjectGetPropertyDataSize(objs[i], &da, 0, NULL, &sz) == noErr && sz) {
+                        UInt32 nd = sz / sizeof(AudioObjectID);
+                        AudioObjectID *devs = calloc(nd, sizeof(AudioObjectID));
+                        if (AudioObjectGetPropertyData(objs[i], &da, 0, NULL, &sz, devs) == noErr)
+                            for (UInt32 k = 0; k < sz / sizeof(AudioObjectID); k++) {
+                                NSString *u = device_string(devs[k], kAudioDevicePropertyDeviceUID);
+                                if (u) [inputs addObject:u];
+                            }
+                        free(devs);
+                    }
+                    char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+                    proc_pidpath(pid, path, sizeof path);
+                    NSString *exe = @(path), *app = exe.lastPathComponent ?: @"", *bundle = @"";
+                    NSRange r = [exe rangeOfString:@".app/"];  // the outermost .app
+                    if (r.location != NSNotFound) {
+                        NSString *appPath = [exe substringToIndex:r.location + 4];
+                        app = appPath.lastPathComponent.stringByDeletingPathExtension;
+                        bundle = [NSBundle bundleWithPath:appPath].bundleIdentifier ?: @"";
+                    }
+                    [list addObject:@{@"pid": @(pid), @"app": app, @"bundle": bundle,
+                                      @"out": @(out != 0), @"in": @(inp != 0), @"inputs": inputs}];
+                }
+                free(objs);
+            }
+        }
+#endif
+        NSData *json = [NSJSONSerialization dataWithJSONObject:list options:0 error:nil];
+        char *res = calloc(json.length + 1, 1);
+        memcpy(res, json.bytes, json.length);
+        return res;
+    }
+}
+
 // Records what the Mac plays (all outputs mixed), leaving out process `exclude_pid`. Pipe
 // and return value as for ba_in_open; this blocks while macOS asks for permission.
 EXPORT int ba_tap_open(int exclude_pid, double rate, int channels, int format, int wfd, BAIn **out) {
     *out = NULL;
 #if HAVE_TAPS
     if (@available(macOS 14.2, *)) {
-        BAIn *in = calloc(1, sizeof *in);
-        in->fd = wfd;  // owned by the stream from here: ba_in_close closes it on failure
-        in->ch = channels == 1 ? 1 : 2;
-        in->rate = rate;
-        in->exclude_pid = exclude_pid;
-        in->s16 = format == 1;
-        atomic_store(&in->alive, 1);
-        OSStatus st;
-        @autoreleasepool {
-            AudioObjectID me = exclude_pid > 0 ? process_object(exclude_pid) : kAudioObjectUnknown;
-            NSArray *exclude = me != kAudioObjectUnknown ? @[@(me)] : @[];
-            in->excluded = me != kAudioObjectUnknown || exclude_pid <= 0;
-            CATapDescription *desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:exclude];
-            desc.name = @"Blurt clip buffer";
-            desc.privateTap = YES;
-            desc.muteBehavior = CATapUnmuted;
-            st = AudioHardwareCreateProcessTap(desc, &in->tap);
-            if (st) { set_error(@"Could not record what the Mac plays", st); ba_in_close(in); return -1; }
-            AudioObjectPropertyAddress fa = {kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal,
-                                             kAudioObjectPropertyElementMain};
-            AudioStreamBasicDescription tf = {0};
-            UInt32 size = sizeof tf;
-            AudioObjectGetPropertyData(in->tap, &fa, 0, NULL, &size, &tf);
-            in->src_rate = tf.mSampleRate > 0 ? tf.mSampleRate : 48000;
-            in->src_ch = tf.mChannelsPerFrame ? tf.mChannelsPerFrame : 2;
-            AudioObjectID out_dev = default_device(0);
-            NSString *out_uid = out_dev ? device_string(out_dev, kAudioDevicePropertyDeviceUID) : nil;
-            NSMutableDictionary *agg = [@{
-                @kAudioAggregateDeviceNameKey: @"Blurt clip buffer",
-                @kAudioAggregateDeviceUIDKey: [NSUUID UUID].UUIDString,
-                @kAudioAggregateDeviceIsPrivateKey: @YES,
-                @kAudioAggregateDeviceIsStackedKey: @NO,
-                @kAudioAggregateDeviceTapAutoStartKey: @YES,
-                @kAudioAggregateDeviceTapListKey: @[@{
-                    @kAudioSubTapDriftCompensationKey: @YES,
-                    @kAudioSubTapUIDKey: desc.UUID.UUIDString,
-                }],
-            } mutableCopy];
-            if (out_uid.length) {
-                agg[@kAudioAggregateDeviceMainSubDeviceKey] = out_uid;
-                agg[@kAudioAggregateDeviceSubDeviceListKey] = @[@{@kAudioSubDeviceUIDKey: out_uid}];
-            }
-            st = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg, &in->agg);
+        BAIn *in = tap_in_open(NULL, 0, exclude_pid, rate, channels, format == 1);
+        if (!in) {
+            if (wfd >= 0) close(wfd);
+            return -1;
         }
-        if (st) { set_error(@"Could not create the clip recorder", st); ba_in_close(in); return -1; }
-        // The tap's audio arrives at the aggregate device's rate, which follows the output
-        // device (44.1 kHz for many headphones), not necessarily the tap's own format.
-        Float64 agg_rate = device_rate(in->agg);
-        if (agg_rate > 0) in->src_rate = agg_rate;
-        if (AudioObjectAddPropertyListener(in->agg, &kRateAddr, setup_changed, &in->alive) == noErr)
-            in->rate_dev = in->agg;
-        AudioObjectPropertyAddress sys = kDefaultOutAddr;
-        if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &sys, setup_changed, &in->alive) == noErr)
-            in->watch_default_out = 1;
-        if (!in_finish_setup(in, 0.5)) { set_error(@"Could not set up audio conversion", 0); ba_in_close(in); return -1; }
-        st = AudioDeviceCreateIOProcID(in->agg, tap_io, in, &in->proc);
-        if (!st) st = AudioDeviceStart(in->agg, in->proc);
-        if (st) { set_error(@"Could not start the clip recorder", st); ba_in_close(in); return -1; }
         int fd = in_start_pipe(in, wfd);
-        if (fd < 0) { set_error(@"Could not start the recording thread", 0); ba_in_close(in); return -1; }
+        if (fd < 0) {
+            if (in->fd < 0 && wfd >= 0) close(wfd);
+            set_error(@"Could not start the recording thread", 0);
+            ba_in_close(in);
+            return -1;
+        }
         *out = in;
         return fd;
     }
@@ -877,11 +993,24 @@ EXPORT void ba_in_close(BAIn *in) {
 typedef struct BALoop {
     BAIn *in;                     // replaced on reopening, under `lock`
     BAOut *out;
-    char in_uid[512];
+    char in_uid[512];             // the microphone, or for a relay:
+    int pids[64];                 // the processes whose sound is relayed
+    int npids;
+    _Atomic float gain;
     pthread_mutex_t lock;
     pthread_t thread;
     _Atomic int stop;
 } BALoop;
+
+static BAIn *loop_open_input(BALoop *lp) {
+#if HAVE_TAPS
+    if (lp->npids) {
+        if (@available(macOS 14.2, *)) return tap_in_open(lp->pids, lp->npids, 0, 48000, 2, 0);
+        return NULL;
+    }
+#endif
+    return in_open_device(lp->in_uid, 48000, 2);
+}
 
 // Plays the microphone into the output until the microphone stream ends (0) or the output
 // does or the loopback is closed (-1).
@@ -910,6 +1039,9 @@ static int loop_run(BALoop *lp) {
                 last_fix = now;
             }
         }
+        float gain = atomic_load(&lp->gain);
+        if (gain != 1.0f)
+            for (int i = 0; i < got * 2; i++) buf[i] *= gain;
         if (ba_out_write(lp->out, buf, got) < 0) return -1;
     }
     return -1;
@@ -928,7 +1060,7 @@ static void *loop_thread(void *ctx) {
         while (!in) {  // try again until the microphone is back (or Blurt stops the loopback)
             for (int i = 0; i < 5 && !atomic_load(&lp->stop); i++) usleep(100000);
             if (atomic_load(&lp->stop)) return NULL;
-            in = in_open_device(lp->in_uid, 48000, 2);
+            in = loop_open_input(lp);
         }
         pthread_mutex_lock(&lp->lock);
         lp->in = in;
@@ -938,11 +1070,33 @@ static void *loop_thread(void *ctx) {
     return NULL;
 }
 
+static BALoop *loop_start(BALoop *lp, const char *out_uid, double latency_ms);
+
 EXPORT void *ba_loop_open(const char *in_uid, const char *out_uid, double latency_ms) {
     BALoop *lp = calloc(1, sizeof *lp);
-    lp->in = in_open_device(in_uid, 48000, 2);
-    if (!lp->in) { free(lp); return NULL; }
     strlcpy(lp->in_uid, in_uid ? in_uid : "", sizeof lp->in_uid);
+    return loop_start(lp, out_uid, latency_ms);
+}
+
+// Relay: plays what the processes `pids` play (e.g. Discord's voices) into an output
+// (Blurt's hidden relay device, which Blurt-Friends carries). Needs macOS 14.2 and the
+// System Audio Recording permission. The sound still plays where it did before, too.
+EXPORT void *ba_relay_open(const int *pids, int npids, const char *out_uid, double latency_ms) {
+    if (npids <= 0) { set_error(@"No app to relay", 0); return NULL; }
+    BALoop *lp = calloc(1, sizeof *lp);
+    lp->npids = npids > 64 ? 64 : npids;
+    memcpy(lp->pids, pids, (size_t)lp->npids * sizeof(int));
+    return loop_start(lp, out_uid, latency_ms);
+}
+
+EXPORT void ba_loop_set_gain(void *p, double gain) {
+    if (p) atomic_store(&((BALoop *)p)->gain, (float)gain);
+}
+
+static BALoop *loop_start(BALoop *lp, const char *out_uid, double latency_ms) {
+    atomic_store(&lp->gain, 1.0f);
+    lp->in = loop_open_input(lp);
+    if (!lp->in) { free(lp); return NULL; }
     pthread_mutex_init(&lp->lock, NULL);
     lp->out = ba_out_open(out_uid, 48000, 2, latency_ms);
     if (!lp->out) { ba_in_close(lp->in); pthread_mutex_destroy(&lp->lock); free(lp); return NULL; }

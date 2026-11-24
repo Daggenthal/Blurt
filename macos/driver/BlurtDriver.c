@@ -1,12 +1,19 @@
 /*
  * Blurt virtual audio driver (Core Audio AudioServerPlugIn).
  *
- * Publishes two devices that share one clock and one ring buffer:
- *   "Blurt-Mix" (UID blurt_mix)  output only: Blurt plays the mix (mic + sounds) into it
- *   "Blurt-Mic" (UID blurt_mic)  input only:  Discord, games, ... record from it
+ * Publishes four devices that share one clock:
+ *   "Blurt internal mix"   (UID blurt_mix,      output, hidden): Blurt plays the mix (your
+ *                          mic + sounds) into it
+ *   "Blurt internal relay" (UID blurt_relay,    output, hidden): Blurt plays the relayed app
+ *                          (e.g. your Discord friends) into it
+ *   "Blurt-Mix"            (UID blurt_mic,      input): the mix - the mic for Discord
+ *   "Blurt-Friends"        (UID blurt_game_mic, input): the mix + the relay - for games
+ * The outputs are hidden, so no app offers them; Blurt finds them by UID. The two mics have
+ * names that say where each belongs: Discord must not get the relay, or your friends would
+ * hear themselves.
  *
- * Whatever is written to Blurt-Mix at sample time t is read back from Blurt-Mic at sample
- * time t. Both devices run at 48 kHz, 32-bit float, interleaved stereo.
+ * Whatever is written to an output at sample time t is read back from the mics at sample
+ * time t. All devices run at 48 kHz, 32-bit float, interleaved stereo.
  *
  * MIT License, part of Blurt (https://github.com/Daggenthal/Blurt).
  */
@@ -25,7 +32,12 @@ enum {
     kObjMixStream = 3,
     kObjMicDevice = 4,
     kObjMicStream = 5,
+    kObjRelayDevice = 6,
+    kObjRelayStream = 7,
+    kObjGameDevice = 8,
+    kObjGameStream = 9,
 };
+#define kNumDevices 4
 
 #define kSampleRate 48000.0
 #define kChannels 2
@@ -33,8 +45,10 @@ enum {
 #define kClockDomain 0x426C7274u /* 'Blrt' */
 #define kBytesPerFrame (kChannels * (UInt32)sizeof(Float32))
 
-#define kMixName "Blurt-Mix"
-#define kMicName "Blurt-Mic"
+#define kMixName "Blurt internal mix"
+#define kMicName "Blurt-Mix"
+#define kRelayName "Blurt internal relay"
+#define kGameName "Blurt-Friends"
 
 /* ---- state ---------------------------------------------------------------------------- */
 static AudioServerPlugInHostRef gHost = NULL;
@@ -43,27 +57,49 @@ static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
 
 static Float64 gTicksPerFrame = 0;
 static UInt64 gAnchorHostTime = 0;
-static UInt32 gIOCount[2] = {0, 0}; /* [0] mix, [1] mic */
+static UInt32 gIOCount[kNumDevices]; /* by DevIndex */
 
-static Float32 gRing[kRingFrames * kChannels];
-static SInt64 gLastWriteEnd = 0;
-static bool gHasWritten = false;
+/* one ring per output: what was written at sample time t, for the mics to read at t */
+typedef struct {
+    Float32 data[kRingFrames * kChannels];
+    SInt64 lastWriteEnd; /* end of the newest write */
+    bool hasWritten;
+} Ring;
+static Ring gRings[2]; /* [0] Blurt-Mix, [1] Blurt-Relay */
 
 /* ---- small helpers -------------------------------------------------------------------- */
-static bool IsDevice(AudioObjectID o) { return o == kObjMixDevice || o == kObjMicDevice; }
-static bool IsStream(AudioObjectID o) { return o == kObjMixStream || o == kObjMicStream; }
-static int DevIndex(AudioObjectID dev) { return dev == kObjMixDevice ? 0 : 1; }
-static AudioObjectID StreamOf(AudioObjectID dev) {
-    return dev == kObjMixDevice ? kObjMixStream : kObjMicStream;
+static bool IsDevice(AudioObjectID o) {
+    return o == kObjMixDevice || o == kObjMicDevice || o == kObjRelayDevice || o == kObjGameDevice;
 }
-static AudioObjectID DeviceOf(AudioObjectID stream) {
-    return stream == kObjMixStream ? kObjMixDevice : kObjMicDevice;
+static bool IsStream(AudioObjectID o) {
+    return o == kObjMixStream || o == kObjMicStream || o == kObjRelayStream || o == kObjGameStream;
 }
-/* does the device have a stream in this scope? (mix: output, mic: input) */
+static int DevIndex(AudioObjectID dev) { return (int)(dev - kObjMixDevice) / 2; } /* 0..3 */
+static AudioObjectID StreamOf(AudioObjectID dev) { return dev + 1; }
+static AudioObjectID DeviceOf(AudioObjectID stream) { return stream - 1; }
+static bool IsOutput(AudioObjectID dev) { return dev == kObjMixDevice || dev == kObjRelayDevice; }
+/* the ring an output writes */
+static Ring *RingOf(AudioObjectID dev) { return &gRings[dev == kObjRelayDevice ? 1 : 0]; }
+/* does the device have a stream in this scope? (outputs: output, mics: input) */
 static bool DevHasScope(AudioObjectID dev, AudioObjectPropertyScope scope) {
     if (scope == kAudioObjectPropertyScopeGlobal) return true;
-    if (dev == kObjMixDevice) return scope == kAudioObjectPropertyScopeOutput;
-    return scope == kAudioObjectPropertyScopeInput;
+    return scope == (IsOutput(dev) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput);
+}
+static CFStringRef DevName(AudioObjectID dev) {
+    switch (dev) {
+    case kObjMixDevice: return CFSTR(kMixName);
+    case kObjRelayDevice: return CFSTR(kRelayName);
+    case kObjGameDevice: return CFSTR(kGameName);
+    default: return CFSTR(kMicName);
+    }
+}
+static CFStringRef DevUID(AudioObjectID dev) {
+    switch (dev) {
+    case kObjMixDevice: return CFSTR("blurt_mix");
+    case kObjRelayDevice: return CFSTR("blurt_relay");
+    case kObjGameDevice: return CFSTR("blurt_game_mic");
+    default: return CFSTR("blurt_mic");
+    }
 }
 
 static void FillFormat(AudioStreamBasicDescription *f) {
@@ -100,70 +136,80 @@ static UInt32 RingIndex(SInt64 t) {
     return (UInt32)(i < 0 ? i + kRingFrames : i);
 }
 
-static void RingZero(SInt64 t, UInt32 frames) {
+static void RingZero(Ring *r, SInt64 t, UInt32 frames) {
     if (frames >= kRingFrames) {
-        memset(gRing, 0, sizeof(gRing));
+        memset(r->data, 0, sizeof(r->data));
         return;
     }
     UInt32 i = RingIndex(t);
     UInt32 first = frames < kRingFrames - i ? frames : kRingFrames - i;
-    memset(gRing + i * kChannels, 0, first * kBytesPerFrame);
-    if (frames > first) memset(gRing, 0, (frames - first) * kBytesPerFrame);
+    memset(r->data + i * kChannels, 0, first * kBytesPerFrame);
+    if (frames > first) memset(r->data, 0, (frames - first) * kBytesPerFrame);
 }
 
-static void RingWrite(SInt64 t, const Float32 *src, UInt32 frames) {
+static void RingWrite(Ring *r, SInt64 t, const Float32 *src, UInt32 frames) {
     UInt32 i = RingIndex(t);
     UInt32 first = frames < kRingFrames - i ? frames : kRingFrames - i;
-    memcpy(gRing + i * kChannels, src, first * kBytesPerFrame);
-    if (frames > first) memcpy(gRing, src + first * kChannels, (frames - first) * kBytesPerFrame);
+    memcpy(r->data + i * kChannels, src, first * kBytesPerFrame);
+    if (frames > first) memcpy(r->data, src + first * kChannels, (frames - first) * kBytesPerFrame);
 }
 
-/* copies out and zeroes what it read */
-static void RingRead(SInt64 t, Float32 *dst, UInt32 frames) {
+/* adds what was written for [t, t + frames) into dst (two mics can read the same ring, so
+ * reading leaves it as it is) */
+static void RingAdd(Ring *r, SInt64 t, Float32 *dst, UInt32 frames) {
     UInt32 i = RingIndex(t);
     UInt32 first = frames < kRingFrames - i ? frames : kRingFrames - i;
-    memcpy(dst, gRing + i * kChannels, first * kBytesPerFrame);
-    memset(gRing + i * kChannels, 0, first * kBytesPerFrame);
-    if (frames > first) {
-        memcpy(dst + first * kChannels, gRing, (frames - first) * kBytesPerFrame);
-        memset(gRing, 0, (frames - first) * kBytesPerFrame);
-    }
+    const Float32 *a = r->data + i * kChannels;
+    for (UInt32 k = 0; k < first * kChannels; k++) dst[k] += a[k];
+    for (UInt32 k = 0; k < (frames - first) * kChannels; k++) dst[first * kChannels + k] += r->data[k];
 }
 
-static void RingReset(void) {
-    memset(gRing, 0, sizeof(gRing));
-    gLastWriteEnd = 0;
-    gHasWritten = false;
+static void RingReset(Ring *r) {
+    memset(r->data, 0, sizeof(r->data));
+    r->lastWriteEnd = 0;
+    r->hasWritten = false;
 }
 
-static void MixWrite(SInt64 t, const Float32 *src, UInt32 frames) {
+static void OutputWrite(Ring *r, SInt64 t, const Float32 *src, UInt32 frames) {
     os_unfair_lock_lock(&gLock);
-    if (gHasWritten && t > gLastWriteEnd) {
+    if (r->hasWritten && t + frames <= r->lastWriteEnd - kRingFrames) {
+        /* far behind the newest write: the timeline went back (or that write's time was
+         * wrong). Start over from here; otherwise the mics would stay silent until the
+         * timeline caught up with it again. */
+        RingReset(r);
+    }
+    if (r->hasWritten && t > r->lastWriteEnd) {
         /* a gap (e.g. an overload): what is there is from one ring ago */
-        SInt64 gap = t - gLastWriteEnd;
-        RingZero(gLastWriteEnd, gap >= kRingFrames ? kRingFrames : (UInt32)gap);
+        SInt64 gap = t - r->lastWriteEnd;
+        RingZero(r, r->lastWriteEnd, gap >= kRingFrames ? kRingFrames : (UInt32)gap);
     }
     if (frames > kRingFrames) { /* keep only the newest ring's worth */
         src += (frames - kRingFrames) * kChannels;
         t += frames - kRingFrames;
         frames = kRingFrames;
     }
-    RingWrite(t, src, frames);
+    RingWrite(r, t, src, frames);
     SInt64 end = t + frames;
-    if (!gHasWritten || end > gLastWriteEnd) gLastWriteEnd = end;
-    gHasWritten = true;
+    if (!r->hasWritten || end > r->lastWriteEnd) r->lastWriteEnd = end;
+    r->hasWritten = true;
     os_unfair_lock_unlock(&gLock);
 }
 
-static void MicRead(SInt64 t, Float32 *dst, UInt32 frames) {
+/* adds the ring's audio for [t, t + frames) to dst, where it has any (call with gLock) */
+static void RingMixInto(Ring *r, SInt64 t, Float32 *dst, UInt32 frames) {
+    if (!r->hasWritten) return;
+    SInt64 lo = t, hi = t + frames;
+    if (lo < r->lastWriteEnd - kRingFrames) lo = r->lastWriteEnd - kRingFrames;
+    if (hi > r->lastWriteEnd) hi = r->lastWriteEnd;
+    if (hi > lo) RingAdd(r, lo, dst + (lo - t) * kChannels, (UInt32)(hi - lo));
+}
+
+/* Blurt-Mix (for Discord): the mix. Blurt-Friends (for games): the mix + the relay. */
+static void MicRead(AudioObjectID dev, SInt64 t, Float32 *dst, UInt32 frames) {
     memset(dst, 0, (size_t)frames * kBytesPerFrame);
     os_unfair_lock_lock(&gLock);
-    if (gHasWritten) {
-        SInt64 lo = t, hi = t + frames;
-        if (lo < gLastWriteEnd - kRingFrames) lo = gLastWriteEnd - kRingFrames;
-        if (hi > gLastWriteEnd) hi = gLastWriteEnd;
-        if (hi > lo) RingRead(lo, dst + (lo - t) * kChannels, (UInt32)(hi - lo));
-    }
+    RingMixInto(&gRings[0], t, dst, frames);
+    if (dev == kObjGameDevice) RingMixInto(&gRings[1], t, dst, frames);
     os_unfair_lock_unlock(&gLock);
 }
 
@@ -196,7 +242,8 @@ static OSStatus Array(const void *items, UInt32 count, UInt32 itemSize, UInt32 i
 
 static OSStatus PlugInProp(const AudioObjectPropertyAddress *a, UInt32 qSize, const void *qData,
                            UInt32 inDataSize, UInt32 *outDataSize, void *outData) {
-    static const AudioObjectID devices[2] = {kObjMixDevice, kObjMicDevice};
+    static const AudioObjectID devices[kNumDevices] = {kObjMixDevice, kObjMicDevice,
+                                                       kObjRelayDevice, kObjGameDevice};
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass: SCALAR(AudioClassID, kAudioObjectClassID);
     case kAudioObjectPropertyClass: SCALAR(AudioClassID, kAudioPlugInClassID);
@@ -204,7 +251,7 @@ static OSStatus PlugInProp(const AudioObjectPropertyAddress *a, UInt32 qSize, co
     case kAudioObjectPropertyManufacturer: SCALAR(CFStringRef, CFSTR("Blurt"));
     case kAudioObjectPropertyOwnedObjects:
     case kAudioPlugInPropertyDeviceList:
-        return Array(devices, 2, sizeof(AudioObjectID), inDataSize, outDataSize, outData);
+        return Array(devices, kNumDevices, sizeof(AudioObjectID), inDataSize, outDataSize, outData);
     case kAudioObjectPropertyCustomPropertyInfoList:
         return Array(NULL, 0, sizeof(AudioServerPlugInCustomPropertyInfo), inDataSize,
                      outDataSize, outData);
@@ -213,8 +260,8 @@ static OSStatus PlugInProp(const AudioObjectPropertyAddress *a, UInt32 qSize, co
         if (outData) {
             if (qSize < sizeof(CFStringRef) || qData == NULL) return kAudioHardwareBadPropertySizeError;
             CFStringRef uid = *(const CFStringRef *)qData;
-            if (uid && CFEqual(uid, CFSTR("blurt_mix"))) found = kObjMixDevice;
-            else if (uid && CFEqual(uid, CFSTR("blurt_mic"))) found = kObjMicDevice;
+            for (UInt32 i = 0; uid && i < kNumDevices; i++)
+                if (CFEqual(uid, DevUID(devices[i]))) found = devices[i];
         }
         SCALAR(AudioObjectID, found);
     }
@@ -225,13 +272,12 @@ static OSStatus PlugInProp(const AudioObjectPropertyAddress *a, UInt32 qSize, co
 
 static OSStatus DeviceProp(AudioObjectID dev, const AudioObjectPropertyAddress *a,
                            UInt32 inDataSize, UInt32 *outDataSize, void *outData) {
-    bool mix = dev == kObjMixDevice;
+    bool output = IsOutput(dev);
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass: SCALAR(AudioClassID, kAudioObjectClassID);
     case kAudioObjectPropertyClass: SCALAR(AudioClassID, kAudioDeviceClassID);
     case kAudioObjectPropertyOwner: SCALAR(AudioObjectID, kObjPlugIn);
-    case kAudioObjectPropertyName:
-        SCALAR(CFStringRef, mix ? CFSTR(kMixName) : CFSTR(kMicName));
+    case kAudioObjectPropertyName: SCALAR(CFStringRef, DevName(dev));
     case kAudioObjectPropertyManufacturer: SCALAR(CFStringRef, CFSTR("Blurt"));
     case kAudioObjectPropertyOwnedObjects:
     case kAudioDevicePropertyStreams: {
@@ -244,8 +290,7 @@ static OSStatus DeviceProp(AudioObjectID dev, const AudioObjectPropertyAddress *
     case kAudioObjectPropertyCustomPropertyInfoList:
         return Array(NULL, 0, sizeof(AudioServerPlugInCustomPropertyInfo), inDataSize,
                      outDataSize, outData);
-    case kAudioDevicePropertyDeviceUID:
-        SCALAR(CFStringRef, mix ? CFSTR("blurt_mix") : CFSTR("blurt_mic"));
+    case kAudioDevicePropertyDeviceUID: SCALAR(CFStringRef, DevUID(dev));
     case kAudioDevicePropertyModelUID: SCALAR(CFStringRef, CFSTR("blurt_model"));
     case kAudioDevicePropertyTransportType: SCALAR(UInt32, kAudioDeviceTransportTypeVirtual);
     case kAudioDevicePropertyRelatedDevices:
@@ -261,7 +306,7 @@ static OSStatus DeviceProp(AudioObjectID dev, const AudioObjectPropertyAddress *
         }
         SCALAR(UInt32, running);
     }
-    case kAudioDevicePropertyDeviceCanBeDefaultDevice: SCALAR(UInt32, mix ? 0 : 1);
+    case kAudioDevicePropertyDeviceCanBeDefaultDevice: SCALAR(UInt32, output ? 0 : 1);
     case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: SCALAR(UInt32, 0);
     case kAudioDevicePropertyLatency: SCALAR(UInt32, 0);
     case kAudioDevicePropertySafetyOffset: SCALAR(UInt32, 0);
@@ -270,7 +315,7 @@ static OSStatus DeviceProp(AudioObjectID dev, const AudioObjectPropertyAddress *
         AudioValueRange r = {kSampleRate, kSampleRate};
         return Array(&r, 1, sizeof(r), inDataSize, outDataSize, outData);
     }
-    case kAudioDevicePropertyIsHidden: SCALAR(UInt32, 0);
+    case kAudioDevicePropertyIsHidden: SCALAR(UInt32, output ? 1 : 0);
     case kAudioDevicePropertyClockIsStable: SCALAR(UInt32, 1);
     case kAudioDevicePropertyZeroTimeStampPeriod: SCALAR(UInt32, kRingFrames);
     case kAudioDevicePropertyPreferredChannelsForStereo: {
@@ -298,19 +343,18 @@ static OSStatus DeviceProp(AudioObjectID dev, const AudioObjectPropertyAddress *
 
 static OSStatus StreamProp(AudioObjectID stream, const AudioObjectPropertyAddress *a,
                            UInt32 inDataSize, UInt32 *outDataSize, void *outData) {
-    bool mix = stream == kObjMixStream;
+    bool output = IsOutput(DeviceOf(stream));
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass: SCALAR(AudioClassID, kAudioObjectClassID);
     case kAudioObjectPropertyClass: SCALAR(AudioClassID, kAudioStreamClassID);
     case kAudioObjectPropertyOwner: SCALAR(AudioObjectID, DeviceOf(stream));
     case kAudioObjectPropertyOwnedObjects:
         return Array(NULL, 0, sizeof(AudioObjectID), inDataSize, outDataSize, outData);
-    case kAudioObjectPropertyName:
-        SCALAR(CFStringRef, mix ? CFSTR(kMixName) : CFSTR(kMicName));
+    case kAudioObjectPropertyName: SCALAR(CFStringRef, DevName(DeviceOf(stream)));
     case kAudioStreamPropertyIsActive: SCALAR(UInt32, 1);
-    case kAudioStreamPropertyDirection: SCALAR(UInt32, mix ? 0 : 1); /* 1 = input */
+    case kAudioStreamPropertyDirection: SCALAR(UInt32, output ? 0 : 1); /* 1 = input */
     case kAudioStreamPropertyTerminalType:
-        SCALAR(UInt32, mix ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeMicrophone);
+        SCALAR(UInt32, output ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeMicrophone);
     case kAudioStreamPropertyStartingChannel: SCALAR(UInt32, 1);
     case kAudioStreamPropertyLatency: SCALAR(UInt32, 0);
     case kAudioStreamPropertyVirtualFormat:
@@ -353,7 +397,8 @@ static OSStatus Initialize(AudioServerPlugInDriverRef drv, AudioServerPlugInHost
     gTicksPerFrame = ticksPerSecond / kSampleRate;
     gAnchorHostTime = mach_absolute_time();
     os_unfair_lock_lock(&gLock);
-    RingReset();
+    RingReset(&gRings[0]);
+    RingReset(&gRings[1]);
     os_unfair_lock_unlock(&gLock);
     return kAudioHardwareNoError;
 }
@@ -456,7 +501,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
     if (!IsDevice(dev)) return kAudioHardwareBadObjectError;
     os_unfair_lock_lock(&gLock);
     bool first = gIOCount[DevIndex(dev)]++ == 0;
-    if (first && dev == kObjMixDevice) RingReset();
+    if (first && IsOutput(dev)) RingReset(RingOf(dev));
     os_unfair_lock_unlock(&gLock);
     if (first) NotifyRunning(dev);
     return kAudioHardwareNoError;
@@ -470,7 +515,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 c
     UInt32 *n = &gIOCount[DevIndex(dev)];
     if (*n > 0) {
         last = --*n == 0;
-        if (last && dev == kObjMixDevice) RingReset();
+        if (last && IsOutput(dev)) RingReset(RingOf(dev));
     }
     os_unfair_lock_unlock(&gLock);
     if (last) NotifyRunning(dev);
@@ -497,8 +542,8 @@ static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID de
                                   UInt32 op, Boolean *outWillDo, Boolean *outInPlace) {
     (void)d; (void)client;
     if (!IsDevice(dev)) return kAudioHardwareBadObjectError;
-    bool yes = (dev == kObjMixDevice && op == kAudioServerPlugInIOOperationWriteMix) ||
-               (dev == kObjMicDevice && op == kAudioServerPlugInIOOperationReadInput);
+    bool yes = IsOutput(dev) ? op == kAudioServerPlugInIOOperationWriteMix
+                             : op == kAudioServerPlugInIOOperationReadInput;
     if (outWillDo) *outWillDo = yes;
     if (outInPlace) *outInPlace = true;
     return kAudioHardwareNoError;
@@ -516,12 +561,14 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
     (void)d; (void)client; (void)secondary;
     if (!IsDevice(dev)) return kAudioHardwareBadObjectError;
     if (ci == NULL || main == NULL) return kAudioHardwareIllegalOperationError;
-    if (op == kAudioServerPlugInIOOperationWriteMix && dev == kObjMixDevice &&
-        stream == kObjMixStream) {
-        MixWrite((SInt64)ci->mOutputTime.mSampleTime, (const Float32 *)main, frames);
-    } else if (op == kAudioServerPlugInIOOperationReadInput && dev == kObjMicDevice &&
-               stream == kObjMicStream) {
-        MicRead((SInt64)ci->mInputTime.mSampleTime, (Float32 *)main, frames);
+    if (stream != StreamOf(dev)) return kAudioHardwareNoError;
+    if (op == kAudioServerPlugInIOOperationWriteMix && IsOutput(dev)) {
+        Float64 t = ci->mOutputTime.mSampleTime;
+        if (t >= 0 && t < 9e15) OutputWrite(RingOf(dev), (SInt64)t, (const Float32 *)main, frames);
+    } else if (op == kAudioServerPlugInIOOperationReadInput && !IsOutput(dev)) {
+        Float64 t = ci->mInputTime.mSampleTime;
+        if (t >= 0 && t < 9e15) MicRead(dev, (SInt64)t, (Float32 *)main, frames);
+        else memset(main, 0, (size_t)frames * kBytesPerFrame);
     }
     return kAudioHardwareNoError;
 }

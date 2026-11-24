@@ -12,6 +12,10 @@
 #define MIX_STREAM 3
 #define MIC 4
 #define MIC_STREAM 5
+#define RELAY 6
+#define RELAY_STREAM 7
+#define GAME 8
+#define GAME_STREAM 9
 #define CH 2
 #define RING 16384
 
@@ -94,28 +98,33 @@ static void IO(AudioObjectID dev, AudioObjectID stream, UInt32 op, Float64 t, fl
 
 static float Sine(Float64 t, int c) { return (float)(0.5 * sin(t * 0.01) + (c ? 0.001 : 0)); }
 
-static void WriteSine(Float64 t, UInt32 n) {
+static float Relay(Float64 t, int c) { return (float)(0.25 * cos(t * 0.003) + (c ? 0.002 : 0)); }
+
+static void WriteTo(AudioObjectID dev, float (*fn)(Float64, int), Float64 t, UInt32 n) {
     float *buf = malloc(n * CH * sizeof(float));
     for (UInt32 i = 0; i < n; i++)
-        for (int c = 0; c < CH; c++) buf[i * CH + c] = Sine(t + i, c);
-    IO(MIX, MIX_STREAM, kAudioServerPlugInIOOperationWriteMix, t, buf, n);
+        for (int c = 0; c < CH; c++) buf[i * CH + c] = fn(t + i, c);
+    IO(dev, dev + 1, kAudioServerPlugInIOOperationWriteMix, t, buf, n);
     free(buf);
 }
+static void WriteSine(Float64 t, UInt32 n) { WriteTo(MIX, Sine, t, n); }
 
-/* returns: 1 = all frames equal the sine, 0 = all silent, -1 = anything else */
-static int ReadKind(Float64 t, UInt32 n) {
+/* returns: 1 = all frames equal want(), 0 = all silent, -1 = anything else */
+static int ReadFrom(AudioObjectID dev, float (*want)(Float64, int), Float64 t, UInt32 n) {
     float *buf = malloc(n * CH * sizeof(float));
     memset(buf, 0x7f, n * CH * sizeof(float)); /* garbage, must be overwritten */
-    IO(MIC, MIC_STREAM, kAudioServerPlugInIOOperationReadInput, t, buf, n);
-    int sine = 1, silent = 1;
+    IO(dev, dev + 1, kAudioServerPlugInIOOperationReadInput, t, buf, n);
+    int same = 1, silent = 1;
     for (UInt32 i = 0; i < n; i++)
         for (int c = 0; c < CH; c++) {
-            if (buf[i * CH + c] != Sine(t + i, c)) sine = 0;
+            if (fabsf(buf[i * CH + c] - want(t + i, c)) > 1e-6f) same = 0;
             if (buf[i * CH + c] != 0.0f) silent = 0;
         }
     free(buf);
-    return sine ? 1 : silent ? 0 : -1;
+    return same ? 1 : silent ? 0 : -1;
 }
+static int ReadKind(Float64 t, UInt32 n) { return ReadFrom(MIC, Sine, t, n); }
+static float Both(Float64 t, int c) { return Sine(t, c) + Relay(t, c); }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -144,22 +153,35 @@ int main(int argc, char **argv) {
     /* plug-in: device list */
     AudioObjectPropertyAddress a = Addr(kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal);
     UInt32 size = 0;
-    AudioObjectID devs[4] = {0};
+    AudioObjectID devs[6] = {0};
     (*drv)->GetPropertyDataSize(drv, 1, 0, &a, 0, NULL, &size);
     (*drv)->GetPropertyData(drv, 1, 0, &a, 0, NULL, sizeof(devs), &size, devs);
-    CHECK(size == 2 * sizeof(AudioObjectID) && devs[0] == MIX && devs[1] == MIC,
-          "device list = [%u, %u]", devs[0], devs[1]);
+    CHECK(size == 4 * sizeof(AudioObjectID) && devs[0] == MIX && devs[1] == MIC &&
+          devs[2] == RELAY && devs[3] == GAME,
+          "device list = [%u, %u, %u, %u]", devs[0], devs[1], devs[2], devs[3]);
 
-    CFStringRef uid = CFSTR("blurt_mic");
-    AudioObjectID found = 0;
-    a = Addr(kAudioPlugInPropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal);
-    (*drv)->GetPropertyData(drv, 1, 0, &a, sizeof(uid), &uid, sizeof(found), &size, &found);
-    CHECK(found == MIC, "TranslateUIDToDevice(blurt_mic) = %u", found);
+    const char *uids[4] = {"blurt_mix", "blurt_mic", "blurt_relay", "blurt_game_mic"};
+    const AudioObjectID ids[4] = {MIX, MIC, RELAY, GAME};
+    int translate_ok = 1;
+    for (int i = 0; i < 4; i++) {
+        CFStringRef uid = CFStringCreateWithCString(NULL, uids[i], kCFStringEncodingUTF8);
+        AudioObjectID found = 0;
+        a = Addr(kAudioPlugInPropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal);
+        (*drv)->GetPropertyData(drv, 1, 0, &a, sizeof(uid), &uid, sizeof(found), &size, &found);
+        CFRelease(uid);
+        translate_ok &= found == ids[i] && StrIs(ids[i], kAudioDevicePropertyDeviceUID, uids[i]);
+    }
+    CHECK(translate_ok, "UIDs and TranslateUIDToDevice for all four devices");
 
-    CHECK(StrIs(MIX, kAudioDevicePropertyDeviceUID, "blurt_mix"), "mix UID");
-    CHECK(StrIs(MIC, kAudioDevicePropertyDeviceUID, "blurt_mic"), "mic UID");
-    CHECK(StrIs(MIX, kAudioObjectPropertyName, "Blurt-Mix"), "mix name");
-    CHECK(StrIs(MIC, kAudioObjectPropertyName, "Blurt-Mic"), "mic name");
+    CHECK(StrIs(MIC, kAudioObjectPropertyName, "Blurt-Mix"), "Discord mic is named Blurt-Mix");
+    CHECK(StrIs(GAME, kAudioObjectPropertyName, "Blurt-Friends"), "game mic is named Blurt-Friends");
+    CHECK(StrIs(MIX, kAudioObjectPropertyName, "Blurt internal mix") &&
+          StrIs(RELAY, kAudioObjectPropertyName, "Blurt internal relay"), "internal output names");
+    CHECK(GetU32(MIX, kAudioDevicePropertyIsHidden) == 1 && GetU32(RELAY, kAudioDevicePropertyIsHidden) == 1 &&
+          GetU32(MIC, kAudioDevicePropertyIsHidden) == 0 && GetU32(GAME, kAudioDevicePropertyIsHidden) == 0,
+          "outputs hidden, mics visible");
+    CHECK(GetU32(RELAY_STREAM, kAudioStreamPropertyDirection) == 0 &&
+          GetU32(GAME_STREAM, kAudioStreamPropertyDirection) == 1, "relay/game stream directions");
     CHECK(StrIs(MIC, kAudioObjectPropertyManufacturer, "Blurt"), "manufacturer");
     CHECK(StrIs(MIC, kAudioDevicePropertyModelUID, "blurt_model"), "model UID");
     CHECK(GetU32(MIX, kAudioDevicePropertyDeviceCanBeDefaultDevice) == 0, "mix can't be default");
@@ -236,7 +258,8 @@ int main(int argc, char **argv) {
     int good = 1;
     for (int b = 0; b < 4; b++) good &= ReadKind(t + b * 512, 512) == 1;
     CHECK(good, "loopback returns the sine across the ring wrap");
-    CHECK(ReadKind(t, 512) == 0, "re-reading the same frames gives silence (zeroed after read)");
+    CHECK(ReadKind(t, 512) == 1, "reading leaves the ring as it is (several mics read it)");
+    CHECK(ReadFrom(GAME, Sine, t, 512) == 1, "Blurt-Friends carries the mix too");
     CHECK(ReadKind(t + 2048, 512) == 0, "reading beyond lastWriteEnd gives silence");
 
     /* partial: read straddling the write end */
@@ -266,8 +289,33 @@ int main(int argc, char **argv) {
     CHECK(ReadKind(g + 1024, 512) == 0, "skipped frames read as silence");
     CHECK(ReadKind(g + RING / 2, 512) == 1, "data after the gap reads back");
 
+    /* the relay: only Blurt-Friends carries it */
+    CHECK((*drv)->StartIO(drv, RELAY, 1) == 0 && (*drv)->StartIO(drv, GAME, 1) == 0, "StartIO relay + game");
+    Float64 r = g + 2 * RING;
+    WriteSine(r, 512);
+    WriteTo(RELAY, Relay, r, 512);
+    CHECK(ReadFrom(GAME, Both, r, 512) == 1, "Blurt-Friends = mix + relay");
+    CHECK(ReadFrom(MIC, Sine, r, 512) == 1, "Blurt-Mix = mix only (no relay: no echo in Discord)");
+    WriteSine(r + 512, 512); /* relay stops writing: Blurt-Friends gets just the mix */
+    CHECK(ReadFrom(GAME, Sine, r + 512, 512) == 1, "relay silent beyond its last write");
+
+    /* a write with a wildly wrong (future) time must not make the mics go silent for good */
+    WriteSine(r + 1024 + 1e12, 512);
+    WriteSine(r + 1024, 512);
+    WriteSine(r + 1536, 512);
+    CHECK(ReadKind(r + 1536, 512) == 1, "recovers after a write far in the future");
+    {   /* invalid times are ignored */
+        float junk[512 * CH];
+        for (int i = 0; i < 512 * CH; i++) junk[i] = 0.9f;
+        IO(MIX, MIX_STREAM, kAudioServerPlugInIOOperationWriteMix, -1e9, junk, 512);
+        IO(MIX, MIX_STREAM, kAudioServerPlugInIOOperationWriteMix, NAN, junk, 512);
+    }
+    CHECK(ReadKind(r + 1536, 512) == 1, "negative/NaN times ignored");
+    CHECK((*drv)->StopIO(drv, RELAY, 1) == 0 && (*drv)->StopIO(drv, GAME, 1) == 0, "StopIO relay + game");
+
     /* stop the mix: mic hears silence */
-    WriteSine(g + RING, 512);
+    WriteSine(r + 4 * RING, 512);
+    g = r + 3 * RING;
     CHECK((*drv)->StopIO(drv, MIX, 1) == 0, "StopIO mix");
     CHECK(GetU32(MIX, kAudioDevicePropertyDeviceIsRunning) == 0, "mix stopped");
     CHECK(ReadKind(g + RING, 512) == 0, "after StopIO of the mix, the mic reads silence");

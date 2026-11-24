@@ -1,7 +1,8 @@
 """Installs Blurt's virtual microphone driver (Blurt.driver) on macOS.
 
 Core Audio loads drivers from /Library/Audio/Plug-Ins/HAL, which needs an administrator
-password once. After installing, the audio system is restarted so Blurt-Mic appears.
+password once. After installing, the audio system is restarted so the mics Blurt-Mix (for
+Discord) and Blurt-Friends (for games) appear.
 """
 import plistlib
 import subprocess
@@ -29,8 +30,9 @@ def version(path):
 
 
 def devices_present():
-    uids = {d["uid"] for d in audio.devices()["devices"]}
-    return "blurt_mix" in uids and "blurt_mic" in uids
+    # (by UID: Blurt's internal outputs are hidden from device lists)
+    return all(audio.device_exists(u) for u in ("blurt_mix", "blurt_mic", "blurt_relay",
+                                                "blurt_game_mic"))
 
 
 def status():
@@ -50,7 +52,7 @@ def _admin(script):
     quoted = script.replace("\\", "\\\\").replace('"', '\\"')
     r = subprocess.run(["osascript", "-e",
                         f'do shell script "{quoted}" with administrator privileges '
-                        f'with prompt "Blurt needs to install its virtual microphone (Blurt-Mic)."'],
+                        f'with prompt "Blurt needs to install its virtual microphones (Blurt-Mix and Blurt-Friends)."'],
                        capture_output=True, text=True)
     if r.returncode != 0:
         err = (r.stderr or "").strip()
@@ -68,7 +70,7 @@ def install(wait=15.0):
     """Copies the driver into place and restarts Core Audio. Returns (ok, message)."""
     src = bundled()
     if src is None:
-        return False, "This copy of Blurt does not include the Blurt-Mic driver."
+        return False, "This copy of Blurt does not include the Blurt-Mix driver."
     ok, msg = _admin(f"rm -rf {_sh(INSTALLED)} && mkdir -p {_sh(INSTALLED.parent)} && "
                      f"cp -R {_sh(src)} {_sh(INSTALLED)} && chown -R root:wheel {_sh(INSTALLED)} && "
                      f"killall coreaudiod")
@@ -82,7 +84,7 @@ def install(wait=15.0):
                 return True, ""
         except Exception:
             pass
-    return False, ("The driver was installed, but Blurt-Mic has not appeared yet. Restarting "
+    return False, ("The driver was installed, but Blurt-Mix has not appeared yet. Restarting "
                    "the Mac should fix this.")
 
 

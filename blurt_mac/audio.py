@@ -49,6 +49,10 @@ def _load():
         "ba_in_close": (None, [p]),
         "ba_in_running": (i, [p]),
         "ba_loop_open": (p, [c, c, d]),
+        "ba_relay_open": (p, [ctypes.POINTER(i), i, c, d]),
+        "ba_loop_set_gain": (None, [p, d]),
+        "ba_procs_json": (p, []),
+        "ba_device_exists": (i, [c]),
         "ba_loop_close": (None, [p]),
         "ba_keys_access": (i, [i]),
         "ba_keys_start": (i, []),
@@ -75,6 +79,21 @@ def devices():
         return json.loads(ctypes.string_at(ptr).decode())
     finally:
         lib.ba_free(ptr)
+
+
+def procs():
+    """Processes that play or record sound: [{"pid", "app", "bundle", "out", "in", "inputs"}].
+    "app" is the app a helper process belongs to (e.g. "Discord" for its audio helper)."""
+    ptr = lib.ba_procs_json()
+    try:
+        return json.loads(ctypes.string_at(ptr).decode())
+    finally:
+        lib.ba_free(ptr)
+
+
+def device_exists(uid):
+    """Also finds hidden devices (Blurt's internal outputs are hidden from other apps)."""
+    return bool(lib.ba_device_exists(str(uid).encode()))
 
 
 def tap_supported():
@@ -228,3 +247,37 @@ class Loopback:
             h, self._h = self._h, None
         if h:
             lib.ba_loop_close(h)
+
+
+class Relay(Loopback):
+    """What some processes play (e.g. Discord's voices), played into an output device too.
+    Opened in the background, as it can wait for the System Audio Recording permission."""
+
+    def __init__(self, pids, sink, latency_ms=30, gain=1.0):
+        self.error = ""
+        self._lock = threading.Lock()
+        self._h = None
+        self._closed = False
+        self._gain = gain
+        self.pids = tuple(pids)
+        threading.Thread(target=self._open_relay, daemon=True,
+                         args=(self.pids, str(sink).encode(), float(latency_ms))).start()
+
+    def _open_relay(self, pids, sink, latency_ms):
+        arr = (ctypes.c_int * len(pids))(*pids)
+        h = lib.ba_relay_open(arr, len(pids), sink, latency_ms)
+        with self._lock:
+            if not h:
+                self.error = last_error()
+                self._closed = True
+            elif self._closed:
+                lib.ba_loop_close(h)
+            else:
+                lib.ba_loop_set_gain(h, self._gain)
+                self._h = h
+
+    def set_gain(self, gain):
+        with self._lock:
+            self._gain = gain
+            if self._h:
+                lib.ba_loop_set_gain(self._h, gain)

@@ -6,7 +6,12 @@ Blurt is a re-implementation of [Soundpad](https://store.steampowered.com/app/62
 
 ## What it does
 
-Blurt provides a virtual microphone called **Blurt-Mic**. Pick that as the input device in your voice app. Others then hear your real microphone plus whatever you play, and you hear the sounds on the output device you choose.
+Blurt provides two virtual microphones:
+
+- **Blurt-Mix**: your real microphone plus whatever you play. Pick it as the input device in Discord.
+- **Blurt-Friends**: the same, plus the app Blurt relays, usually Discord. Pick it as the microphone in a game, so people in the game hear you and your Discord friends at the same time.
+
+You hear the sounds on the output device you choose.
 
 ## Features
 
@@ -18,6 +23,7 @@ Blurt provides a virtual microphone called **Blurt-Mic**. Pick that as the input
 - **Clipping:** Blurt keeps a rolling buffer of what plays on your output. Press a hotkey to clip the last 0.2 to 30 seconds, replay it through the mic, edit it, or save it to your library. Blurt's own playback is left out of the clip.
 - **Editor:** a waveform view where you select, trim, cut, zoom and undo, with a preview that only you hear.
 - **Effects:** noise reduction, click removal, noise gate, amplify, normalize, fades, reverse, silence, repeat, speed, pitch, echo, reverb, bass boost, distortion, telephone and robot. Each one can be previewed before it is applied.
+- **Relay to Blurt-Friends:** pass an app's sound, usually your friends in Discord, into Blurt-Friends, with its own volume slider and a hotkey to turn it on or off. You still hear the app as usual. Keep Discord's mic on Blurt-Mix: if Discord picks Blurt-Friends, your friends would hear themselves, so Blurt pauses the relay and tells you.
 - **Noise gate:** mutes your mic between words so breaths, typing and background noise are not heard. Toggle it in the main window or with a hotkey, and set the threshold with the live level meter.
 - **Voice changer:** change your live mic voice. Includes a B1 Battle Droid voice, and AI voices from any RVC model you download (for example Miku or Teto). Record a test (5 to 30 seconds) to hear the result privately before anyone else hears it, or turn on "Hear myself live".
 - **Refresh:** press **Refresh** (or F5) to pick up new audio files without restarting: files copied into Blurt's sounds folder, and new files in folders you imported. Blurt also checks whenever you switch back to its window.
@@ -81,13 +87,13 @@ bash macos/build_app.sh
 
 This creates `dist/Blurt.app` and `dist/Blurt-<version>-<arch>.dmg`.
 
-The first time you start Blurt, it offers to install its virtual microphone driver. macOS asks for your password once, because audio drivers live in `/Library/Audio/Plug-Ins/HAL`. Then macOS asks for up to three permissions, each needed for one feature:
+The first time you start Blurt, it offers to install its virtual microphone driver, which provides Blurt-Mix and Blurt-Friends. macOS asks for your password once, because audio drivers live in `/Library/Audio/Plug-Ins/HAL`. Then macOS asks for up to three permissions, each needed for one feature:
 
 | Permission | Needed for |
 |---|---|
 | Microphone | your real mic in the mix, the noise gate and the voice changer |
 | Input Monitoring | hotkeys that work while a game or another app is focused (without it, hotkeys only work in Blurt's window) |
-| Screen & System Audio Recording | clipping what you hear (the "Clip from: What I hear" option) |
+| Screen & System Audio Recording | clipping what you hear (the "Clip from: What I hear" option), and relaying an app such as Discord to Blurt-Friends |
 
 If you said no to one of them, turn it on later in **System Settings > Privacy & Security**. Global hotkeys start working as soon as you allow Input Monitoring, without restarting Blurt.
 
@@ -111,9 +117,12 @@ Start **Blurt** from your application menu (Linux) or from Applications or Launc
 
 Then:
 
-1. Select **Blurt-Mic** as the microphone in Discord or your game.
+1. Select **Blurt-Mix** as the microphone in Discord, and **Blurt-Friends** as the microphone in your game.
 2. In Blurt, pick your real microphone under Input and your headphones or speakers under Output.
 3. Import some sounds, right-click one and choose **Set hotkey**.
+4. To let people in the game hear your Discord friends too, tick **On** next to **Relay to Blurt-Friends** (with Discord selected in the list next to it).
+
+On Linux, Blurt also creates outputs named **Blurt-Internal-…**. They are for Blurt's own use; don't pick them in other apps. On macOS they are hidden.
 
 ## Voice changer
 
@@ -125,7 +134,7 @@ Click **Voice** in the main window.
 - **Saved settings:** each voice remembers its own settings. **Save settings as** keeps named versions (for example "talking" and "singing"), with a backup next to the model file, so they come back even if the voice is removed and added again.
 - **Automatic settings:** after your first test recording, Blurt measures your voice and sets the pitch shift for the kind of voice you picked (high, medium or low). It also measures how fast your computer runs the voice and picks the live responsiveness.
 - **Test first:** press **Record test**, speak, then press **Play with voice** to hear the result (only you hear it).
-- **Go live:** tick **Others hear this voice** to send it to Blurt-Mic. A hotkey can toggle it.
+- **Go live:** tick **Others hear this voice** to send it to Blurt-Mix and Blurt-Friends. A hotkey can toggle it.
 
 If the live AI voice skips, **Performance details** in the Voice window shows which step takes the time (speech features, index search, pitch tracking or the model itself), along with CPU speed, system load and model details. It can copy or save a report, and also writes one to `~/.local/share/blurt/voice-performance.log` every 15 seconds.
 
@@ -149,7 +158,9 @@ On a Mac, **Use the graphics card** uses the Mac's graphics chip through Metal; 
 ## Notes
 
 - Hotkeys are observed, not captured, so the key press still reaches the game. Bind keys the game does not use.
-- On Linux, the virtual microphone only exists while Blurt is running. On macOS, Blurt-Mic is always there (a driver cannot come and go with an app); it is silent while Blurt is closed.
+- On Linux, the virtual microphones only exist while Blurt is running. On macOS, Blurt-Mix and Blurt-Friends are always there (a driver cannot come and go with an app); they are silent while Blurt is closed.
+- Relaying an app needs PipeWire on Linux, and macOS 14.2 or later with the Screen & System Audio Recording permission on a Mac. It works in one direction: people in the game hear your Discord friends, but your Discord friends do not hear the game's voice chat. Let your friends know that people in the game can hear them.
+- Blurt-Mix used to be called Blurt-Mic. Apps that had it selected keep it after updating.
 - On macOS, hotkeys use the same keys as on Linux, so a library copied between the two keeps its hotkeys. Option is shown as Option and Command as Cmd.
 - Sounds saved from the editor are stored as WAV.
 

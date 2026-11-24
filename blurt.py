@@ -2,13 +2,17 @@
 """Blurt - a soundboard for Linux and macOS that plays audio files through your microphone.
 
 How it works:
-  * a virtual output "Blurt-Mix"  receives your real mic + the sounds you play
-  * a virtual mic    "Blurt-Mic"  exposes that mix; pick it in Discord / games
+  * an internal output (blurt_mix) receives your real mic + the sounds you play
+  * the virtual mic "Blurt-Mix" (blurt_mic) carries that mix; pick it in Discord
+  * the virtual mic "Blurt-Friends" (blurt_game_mic) carries the mix plus an app Blurt
+    relays (e.g. your Discord friends, via the internal output blurt_relay); pick it in a
+    game, so people there hear you and your friends. Discord must not use it, or your
+    friends would hear themselves.
   * every sound is also played to your chosen output so you can hear it
 
-On Linux the two devices are a PipeWire / PulseAudio sink and source made with pactl. On
-macOS they come from Blurt's own Core Audio driver, and the blurt_mac package stands in for
-pactl, pacat, parec and /dev/input.
+On Linux the devices are PipeWire / PulseAudio sinks and sources made with pactl. On macOS
+they come from Blurt's own Core Audio driver, and the blurt_mac package stands in for pactl,
+pacat, parec and /dev/input.
 """
 import atexit
 import fcntl
@@ -63,8 +67,11 @@ if IS_MAC:
     from blurt_mac import audio as macaudio, keys as mackeys, sysinfo as macsysinfo
 
 APP = "Blurt"
-MIX_SINK, MIX_DESC = "blurt_mix", "Blurt-Mix"
-MIC_SOURCE, MIC_DESC = "blurt_mic", "Blurt-Mic"
+MIX_SINK, MIX_DESC = "blurt_mix", "Blurt-Internal-Mix"
+MIC_SOURCE, MIC_DESC = "blurt_mic", "Blurt-Mix"              # the mic for Discord
+RELAY_SINK, RELAY_DESC = "blurt_relay", "Blurt-Internal-Relay"
+GAME_SINK, GAME_DESC = "blurt_game", "Blurt-Internal-Game"
+GAME_SOURCE, GAME_MIC_DESC = "blurt_game_mic", "Blurt-Friends"  # the mic for games
 CAP_SINK, CAP_DESC = "blurt_capture", "Blurt-Clip-Buffer"
 AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4a", ".aac",
               ".wma", ".webm", ".mka", ".aiff", ".aif"}
@@ -273,6 +280,9 @@ class Router:
     def __init__(self):
         self.modules = []
         self.loop_module = None
+        self.relay_loop = None        # the loopback relay sink -> Blurt-Friends (its volume)
+        self.relay_supported = False
+        self.relay_gain = None
         self.ok = False
         self.message = ""
 
@@ -282,7 +292,8 @@ class Router:
             return
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) >= 3 and any(n in parts[2] for n in (MIX_SINK, MIC_SOURCE, CAP_SINK)):
+            if len(parts) >= 3 and any(n in parts[2] for n in (MIX_SINK, MIC_SOURCE, CAP_SINK,
+                                                                RELAY_SINK, GAME_SINK)):
                 pactl("unload-module", parts[0])
 
     def setup(self):
@@ -302,7 +313,142 @@ class Router:
         else:
             self.message = f"Select “Monitor of {MIX_DESC}” as the microphone in your apps."
         self.ok = True
+        self._setup_game_mic()
         return True
+
+    def _load(self, *args):
+        rc, out, _ = pactl("load-module", *args)
+        if rc == 0:
+            self.modules.append(out)
+            return out
+        return None
+
+    def _setup_game_mic(self):
+        """Blurt-Friends: the mix plus the relay sink, which an app (e.g. Discord) is linked
+        into while relaying."""
+        ok = (self._load("module-null-sink", f"sink_name={GAME_SINK}",
+                         f"sink_properties=device.description={GAME_DESC}")
+              and self._load("module-remap-source", f"master={GAME_SINK}.monitor",
+                             f"source_name={GAME_SOURCE}",
+                             f"source_properties=device.description={GAME_MIC_DESC}")
+              and self._load("module-loopback", f"source={MIX_SINK}.monitor", f"sink={GAME_SINK}",
+                             "latency_msec=20", "source_dont_move=true", "sink_dont_move=true")
+              and self._load("module-null-sink", f"sink_name={RELAY_SINK}",
+                             f"sink_properties=device.description={RELAY_DESC}"))
+        self.relay_loop = ok and self._load(
+            "module-loopback", f"source={RELAY_SINK}.monitor", f"sink={GAME_SINK}",
+            "latency_msec=20", "source_dont_move=true", "sink_dont_move=true")
+        self.relay_supported = bool(self.relay_loop and shutil.which("pw-dump")
+                                    and shutil.which("pw-link"))
+        self.relay_gain = None
+        if self.relay_loop:
+            self.message = f"Mic for Discord: “{MIC_DESC}”. Mic for games: “{GAME_MIC_DESC}”."
+
+    # ---- relay: an app's sound (e.g. Discord friends) into Blurt-Friends -----------------
+    @staticmethod
+    def _graph():
+        objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True,
+                                         timeout=5).stdout or "[]")
+        nodes, ports, links = {}, {}, []
+        for o in objs:
+            kind, info = o.get("type", "").rsplit(":", 1)[-1], o.get("info") or {}
+            props = info.get("props") or {}
+            if kind == "Node":
+                nodes[o["id"]] = props
+            elif kind == "Port":
+                ports[o["id"]] = (props.get("node.id"), info.get("direction"),
+                                  props.get("audio.channel"))
+            elif kind == "Link":
+                links.append((o["id"], info.get("output-node-id"), info.get("output-port-id"),
+                              info.get("input-node-id"), info.get("input-port-id")))
+        return nodes, ports, links
+
+    @staticmethod
+    def _app_of(props):
+        """(key, label) of the app a stream belongs to; ("", "") for Blurt's own."""
+        if (str(props.get("application.process.id")) == str(os.getpid())
+                or str(props.get("node.name", "")).startswith("blurt_")
+                or str(props.get("application.name", "")).startswith("Blurt")):
+            return "", ""
+        label = str(props.get("application.process.binary") or props.get("application.name")
+                    or "")
+        return label.lower(), label
+
+    def list_apps(self):
+        """Apps that play sound now: [(key, label)]."""
+        try:
+            nodes, _ports, _links = self._graph()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return []
+        apps = {}
+        for props in nodes.values():
+            if props.get("media.class") == "Stream/Output/Audio":
+                key, label = self._app_of(props)
+                if key:
+                    apps[key] = label
+        return sorted(apps.items(), key=lambda kv: kv[1].lower())
+
+    def update_relay(self, key, gain):
+        """Relay the app `key` (None = off) at volume `gain` (0..1); called again every few
+        seconds to follow the app's streams. Returns (state, text) like the macOS Router."""
+        if not self.ok or not getattr(self, "relay_loop", None):
+            return ("off", "") if not key else ("error", "Blurt-Friends could not be created.")
+        if not self.relay_supported:
+            return ("off", "") if not key else ("error", "Relaying an app needs PipeWire.")
+        try:
+            return self._sync_relay(key, gain)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
+            return "error", f"The relay failed: {e}"
+
+    def _sync_relay(self, key, gain):
+        nodes, ports, links = self._graph()
+        by_name = {p.get("node.name"): i for i, p in nodes.items()}
+        relay, game_mic = by_name.get(RELAY_SINK), by_name.get(GAME_SOURCE)
+        if relay is None:
+            return "error", "Blurt-Friends is missing; restart Blurt."
+        state, text = "off", ""
+        wanted = set()
+        if key:
+            outs = [i for i, p in nodes.items() if p.get("media.class") == "Stream/Output/Audio"
+                    and self._app_of(p)[0] == key]
+            ins = {i for i, p in nodes.items() if p.get("media.class") == "Stream/Input/Audio"
+                   and self._app_of(p)[0] == key}
+            name = next((self._app_of(nodes[i])[1] for i in list(outs) + list(ins)),
+                        key[:1].upper() + key[1:])
+            if any(on == game_mic and inn in ins for _l, on, _op, inn, _ip in links):
+                state, text = "loop", (
+                    f"Paused: {name} uses “{GAME_MIC_DESC}” as its mic, so your friends would "
+                    f"hear themselves. Set {name}'s mic to “{MIC_DESC}”.")
+            elif not outs:
+                state, text = "waiting", f"Waiting for {name} to play sound…"
+            else:
+                state, text = "on", f"{name} → {GAME_MIC_DESC}"
+                relay_in = {ch: pid for pid, (nid, d, ch) in ports.items()
+                            if nid == relay and d == "input"}
+                for pid, (nid, d, ch) in ports.items():
+                    if nid in outs and d == "output":
+                        for c in OutputTee._capture_channels(ch):
+                            if c in relay_in:
+                                wanted.add((pid, relay_in[c]))
+        have = {(op, ip): lid for lid, _on, op, inn, ip in links if inn == relay}
+        for pair in wanted - set(have):
+            subprocess.run(["pw-link", str(pair[0]), str(pair[1])], capture_output=True, timeout=5)
+        for pair in set(have) - wanted:
+            subprocess.run(["pw-link", "-d", str(have[pair])], capture_output=True, timeout=5)
+        if state == "on" and gain != self.relay_gain:
+            self._set_relay_volume(gain)
+        return state, text
+
+    def _set_relay_volume(self, gain):
+        rc, out, _ = pactl("-f", "json", "list", "sink-inputs")
+        if rc != 0:
+            return
+        for si in json.loads(out or "[]"):
+            if str(si.get("owner_module")) == str(self.relay_loop):
+                # (PulseAudio percentages are cubic: 50% is 1/8 of the amplitude)
+                pct = 100 * max(0.0, gain) ** (1 / 3)
+                pactl("set-sink-input-volume", str(si.get("index")), f"{pct:.1f}%")
+                self.relay_gain = gain
 
     def set_mic(self, source_name):
         """Feed the real microphone into the mix (None = sounds only)."""
@@ -346,6 +492,7 @@ class Router:
         if self.loop_module:
             pactl("unload-module", self.loop_module)
             self.loop_module = None
+        self.relay_loop = None
         for m in reversed(self.modules):
             pactl("unload-module", m)
         self.modules = []
@@ -857,6 +1004,14 @@ class Engine(QtCore.QObject):
             self.outs["me"].gain = self.gains["me"]
 
     def find_mix(self):
+        if IS_MAC:  # (the driver hides its internal output from device lists, Qt's included)
+            if not macaudio.device_exists(MIX_SINK):
+                self.mix_ok = False
+                self._open("mic", None)
+            elif not self.mix_ok or "mic" not in self.outs:
+                self._open("mic", MIX_SINK)
+                self.mix_ok = True
+            return self.mix_ok
         for dev in QMediaDevices.audioOutputs():
             if is_mix_device(dev):
                 self.out_mic.setDevice(dev)
@@ -2594,7 +2749,7 @@ class VoiceDialog(QtWidgets.QDialog):
         # live
         live = W.QGroupBox("Live")
         ll = W.QVBoxLayout(live)
-        self.on_mic = W.QCheckBox("Others hear this voice (on Blurt-Mic)")
+        self.on_mic = W.QCheckBox("Others hear this voice (on Blurt-Mix and Blurt-Friends)")
         self.on_mic.toggled.connect(self._live_changed)
         self.monitor = W.QCheckBox("Hear myself live")
         self.monitor.setToolTip("Plays your changed voice in your headphones. Use headphones, "
@@ -4044,10 +4199,22 @@ ACTIONS = {"stop": "Stop", "pause": "Pause / resume", "random": "Play random sou
            "clip": "Clip what just played", "replay_clip": "Replay last clip",
            "save_clip": "Save last clip to library",
            "voice": "Voice changer on/off (for others)",
-           "gate": "Noise gate on/off"}
+           "gate": "Noise gate on/off",
+           "relay": "Relay to Blurt-Friends on/off"}
+
+
+class AppCombo(QtWidgets.QComboBox):
+    """A combo box that asks for fresh items each time it opens."""
+    opening = QtCore.Signal()
+
+    def showPopup(self):
+        self.opening.emit()
+        super().showPopup()
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    relay_result = QtCore.Signal(str, str)  # state, text (from the background check)
+
     def __init__(self, store, router, engine, keys):
         super().__init__()
         self.store, self.router, self.engine, self.keys = store, router, engine, keys
@@ -4235,6 +4402,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.gate_box.setEnabled(False)
         grid.addWidget(W.QLabel("Noise gate:"), 3, 0)
         grid.addLayout(gate_row, 3, 1, 1, 4)
+        grid.addWidget(W.QLabel("Relay to Blurt-Friends:"), 4, 0)
+        grid.addLayout(self._build_relay_row(), 4, 1, 1, 4)
         self.meter_timer = QtCore.QTimer(self)
         self.meter_timer.timeout.connect(self._update_meter)
         self.meter_timer.start(100)
@@ -4253,6 +4422,108 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "Hotkeys only work while this window is focused. For global hotkeys: "
                 "sudo usermod -aG input $USER, then log out and back in.")
+
+    # ---- relay: an app (e.g. your Discord friends) into Blurt-Friends -----------------------
+    def _relay_cfg(self):
+        return self.store.settings.setdefault(
+            "relay", {"on": False, "app": "discord", "label": "Discord", "volume": 80})
+
+    def _build_relay_row(self):
+        W = QtWidgets
+        cfg = self._relay_cfg()
+        row = W.QHBoxLayout()
+        self.relay_box = W.QCheckBox("On")
+        self.relay_box.setToolTip(
+            f"People who hear “{GAME_MIC_DESC}” (set it as the mic in your game) also hear this "
+            f"app, e.g. your friends in Discord. Keep Discord's mic on “{MIC_DESC}”, so your "
+            "friends do not hear themselves.")
+        self.relay_box.setChecked(bool(cfg["on"]))
+        self.relay_box.toggled.connect(self._relay_toggled)
+        self.relay_app = AppCombo()
+        self.relay_app.setToolTip("The app to relay. The list shows apps that are playing sound.")
+        self.relay_app.addItem(cfg.get("label") or cfg["app"], cfg["app"])
+        self.relay_app.opening.connect(self._relay_fill_apps)
+        self.relay_app.activated.connect(self._relay_app_chosen)
+        self.relay_vol = W.QSlider(Qt.Horizontal)
+        self.relay_vol.setRange(0, 100)
+        self.relay_vol.setValue(int(cfg["volume"]))
+        self.relay_vol.setMaximumWidth(160)
+        self.relay_vol.setToolTip("How loud the relayed app is on Blurt-Friends")
+        self.relay_vol.valueChanged.connect(self._relay_volume)
+        self.relay_vol.sliderReleased.connect(self.store.save)
+        self.relay_status = W.QLabel("")
+        self.relay_status.setWordWrap(True)
+        for wdg in (self.relay_box, self.relay_app, W.QLabel("Volume:"), self.relay_vol):
+            row.addWidget(wdg)
+        row.addWidget(self.relay_status, 1)
+        self._relay_busy = False
+        self._relay_lock = threading.Lock()
+        self.relay_result.connect(self._relay_show)
+        self.relay_timer = QtCore.QTimer(self)
+        self.relay_timer.timeout.connect(self._relay_check)
+        self.relay_timer.start(2000)
+        QtCore.QTimer.singleShot(0, self._relay_check)
+        return row
+
+    def _relay_fill_apps(self):
+        cfg = self._relay_cfg()
+        apps = dict(self.router.list_apps() if hasattr(self.router, "list_apps") else [])
+        apps.setdefault(cfg["app"], cfg.get("label") or cfg["app"])
+        self.relay_app.blockSignals(True)
+        self.relay_app.clear()
+        for key, label in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+            self.relay_app.addItem(label, key)
+        self.relay_app.setCurrentIndex(max(0, self.relay_app.findData(cfg["app"])))
+        self.relay_app.blockSignals(False)
+
+    def _relay_app_chosen(self, _i):
+        cfg = self._relay_cfg()
+        cfg["app"], cfg["label"] = self.relay_app.currentData(), self.relay_app.currentText()
+        self.store.save()
+        self._relay_check()
+
+    def _relay_toggled(self, on):
+        self._relay_cfg()["on"] = on
+        self.store.save()
+        self.statusBar().showMessage(
+            f"Relay to {GAME_MIC_DESC} " + ("on" if on else "off"), 3000)
+        self._relay_check()
+
+    def toggle_relay(self):
+        self.relay_box.setChecked(not self.relay_box.isChecked())
+
+    def _relay_volume(self, value):
+        self._relay_cfg()["volume"] = value
+        self._relay_check()
+
+    def _relay_check(self):
+        """Apply the relay setting in the background (finding the app's streams can take a
+        moment), and show how it went."""
+        if self._relay_busy or not hasattr(self.router, "update_relay"):
+            return
+        cfg = self._relay_cfg()
+        key = cfg["app"] if cfg["on"] else None
+        gain = (max(0, min(100, cfg["volume"])) / 100.0) ** 2
+        self._relay_busy = True
+
+        def work():
+            try:
+                with self._relay_lock:
+                    state, text = self.router.update_relay(key, gain)
+            except Exception as e:  # shown to the user
+                state, text = "error", f"The relay failed: {e}"
+            self.relay_result.emit(state, text)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _relay_show(self, state, text):
+        self._relay_busy = False
+        colour = {"loop": "#c0392b", "error": "#c0392b"}.get(state)
+        self.relay_status.setText(f'<span style="color:{colour}">{text}</span>' if colour else text)
+        if state == "loop" and getattr(self, "_relay_warned", None) != text:
+            self._relay_warned = text
+            self.statusBar().showMessage(text, 10000)
+        elif state != "loop":
+            self._relay_warned = None
 
     def _volume(self, key, default, setter):
         s = QtWidgets.QSlider(Qt.Horizontal)
@@ -4933,7 +5204,8 @@ class MainWindow(QtWidgets.QMainWindow):
             {"stop": self.engine.stop, "pause": self.engine.toggle_pause,
              "random": self.play_random, "clip": self.clip,
              "replay_clip": self.replay_clip, "save_clip": self.save_clip_quick,
-             "voice": self.toggle_voice, "gate": self.toggle_gate}[target]()
+             "voice": self.toggle_voice, "gate": self.toggle_gate,
+             "relay": self.toggle_relay}[target]()
 
     def eventFilter(self, obj, ev):
         # Fallback when /dev/input is not readable: hotkeys while the window has focus.
@@ -4949,18 +5221,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def ensure_mac_driver():
-    """Offer to install (or update) the driver that provides Blurt-Mic on macOS."""
+    """Offer to install (or update) the driver that provides Blurt's mics on macOS."""
     from blurt_mac import driver
     state = driver.status()
     if state not in ("missing", "outdated"):
         return
     if state == "missing":
-        text = ("Blurt needs to install its virtual microphone, “Blurt-Mic”, once. Discord, "
-                "games and other apps hear your sounds through it.\n\nmacOS will ask for "
-                "your password.")
+        text = ("Blurt needs to install its virtual microphones once: “Blurt-Mix” for "
+                "Discord, and “Blurt-Friends” for games (it can also carry your Discord "
+                "friends). Apps hear your sounds through them.\n\nmacOS will ask for your "
+                "password.")
     else:
-        text = ("This version of Blurt comes with an updated Blurt-Mic driver. Install it "
-                "now?\n\nmacOS will ask for your password.")
+        text = ("This version of Blurt comes with an updated driver: your Blurt-Mic is now "
+                "called “Blurt-Mix” (Discord keeps it selected), and there is a new mic for "
+                "games, “Blurt-Friends”, which can also carry your Discord friends. Install it "
+                "now?\n\nmacOS will ask for your password. Audio stops for a moment while "
+                "it installs.")
     box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Information, APP, text)
     install = box.addButton("Install", QtWidgets.QMessageBox.AcceptRole)
     box.addButton("Not now", QtWidgets.QMessageBox.RejectRole)
