@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+# macOS build output (bash macos/build_app.sh)
+macos/build/
+dist/

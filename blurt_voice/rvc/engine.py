@@ -11,6 +11,8 @@ Every .pth is loaded with torch.load(weights_only=True), which refuses files tha
 embedded code.
 """
 import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -81,10 +83,59 @@ def cpu_has_bf16():
 GPU_ERROR = ""  # why the graphics card is not used, for the performance report
 
 
+IS_MAC = sys.platform == "darwin"
+GPU_DEVICES = ("cuda", "mps")  # mps: the Apple graphics chip, through Metal
+
+
+def _sysctl(name):
+    try:
+        return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True,
+                              timeout=3).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def gpu_name(device):
+    if device == "cuda":
+        return torch.cuda.get_device_name(0)
+    if device == "mps":
+        return (_sysctl("machdep.cpu.brand_string") or "Apple") + " graphics (Metal)"
+    return ""
+
+
+def sync(device):
+    """Wait for queued GPU work, so timings are real."""
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
+
+
+def _pick_mps(use_gpu):
+    global GPU_ERROR
+    if not use_gpu:
+        GPU_ERROR = "turned off in Blurt"
+        return "cpu"
+    if not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        GPU_ERROR = "PyTorch cannot use Metal on this Mac"
+        return "cpu"
+    try:
+        a = torch.randn(256, 256, device="mps")
+        if torch.isfinite(a @ a).all():
+            return "mps"
+        GPU_ERROR = "the graphics chip returned wrong results"
+    except Exception as e:
+        GPU_ERROR = f"the graphics chip failed a test: {e}"
+    return "cpu"
+
+
 def pick_device(use_gpu=True):
-    """'cuda' (NVIDIA, or AMD through ROCm) when it really works, otherwise 'cpu'."""
+    """'cuda' (NVIDIA, or AMD through ROCm) or 'mps' (Apple) when it really works, otherwise
+    'cpu'."""
     global GPU_ERROR
     GPU_ERROR = ""
+    if IS_MAC:
+        return _pick_mps(use_gpu)
     # live blocks always have the same size, so let cuDNN/MIOpen pick the fastest kernels once
     torch.backends.cudnn.benchmark = True
     if not use_gpu:
@@ -109,6 +160,14 @@ def pick_device(use_gpu=True):
 
 def gpu_diagnosis():
     """Everything that decides whether PyTorch can use an AMD graphics card, as text lines."""
+    if IS_MAC:
+        mps = getattr(torch.backends, "mps", None)
+        lines = [f"PyTorch {torch.__version__}: Metal (MPS) "
+                 + ("available" if mps and mps.is_available() else "not available"),
+                 f"Chip: {_sysctl('machdep.cpu.brand_string') or 'unknown'}"]
+        if GPU_ERROR:
+            lines.append(f"Why the CPU is used: {GPU_ERROR}")
+        return lines, []
     import grp
     lines, advice = [], []
     build = "CPU only"
@@ -201,7 +260,7 @@ class Helpers:
         return torch.autocast("cpu", enabled=False)
 
     def describe(self):
-        where = "graphics card" if self.device == "cuda" else "CPU"
+        where = "graphics card" if self.device in GPU_DEVICES else "CPU"
         fast = {torch.float16: ", float16", torch.bfloat16: ", bfloat16"}.get(
             self.autocast[1] if self.autocast else None, ", float32")
         kernels = ""
@@ -285,8 +344,7 @@ class RVCVoice:
             return self._infer_inner(audio16, shift, index_rate, protect, keep, f0)
 
     def _sync(self):
-        if self.device == "cuda":
-            torch.cuda.synchronize()  # so GPU timings are real, not just queued work
+        sync(self.device)  # so GPU timings are real, not just queued work
 
     def _infer_inner(self, audio16, shift, index_rate, protect, keep, f0):
         times = self.times = {}
@@ -550,7 +608,7 @@ def benchmark(voice, block_s=0.45, context_s=1.0):
     test = (0.1 * np.sign(np.sin(2 * np.pi * 140 * t)) * np.sin(2 * np.pi * 3 * t) ** 2
             ).astype(np.float32)
     costs = []
-    rounds = 6 if voice.device == "cuda" else 3
+    rounds = 6 if voice.device in GPU_DEVICES else 3
     test = np.tile(test, 2)
     for i in range(rounds):
         stream.process(test[(i % 3) * stream.block:((i % 3) + 1) * stream.block])
@@ -671,6 +729,12 @@ def tune_gpu(voice, block_s=0.3, context_s=1.0, allow_half=True, progress=None):
 def set_threads():
     """One thread per physical core for torch, and avoid slow denormal maths."""
     torch.set_flush_denormal(True)
+    if IS_MAC:  # Apple silicon: the performance cores (efficiency cores only slow it down)
+        try:
+            torch.set_num_threads(max(1, int(_sysctl("hw.perflevel0.physicalcpu")
+                                             or _sysctl("hw.physicalcpu"))))
+        except ValueError:
+            pass
     try:
         cores = len({tuple(Path(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")
                            .read_text().strip().split(","))
