@@ -14,6 +14,12 @@
 # without Gatekeeper warnings, sign with a Developer ID and notarize:
 #   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 #   NOTARY_PROFILE=<notarytool keychain profile> bash macos/build_app.sh
+# The GitHub build (.github/workflows/mac-app.yml) signs with a self-signed certificate
+# instead (SIGN_IDENTITY = its SHA-1, SIGN_KEYCHAIN = the keychain holding it): macOS then
+# keeps Blurt's permissions across updates, because every build has the same signer.
+#
+# BLURT_COMMIT (default: the git commit) is stored in the app, so it knows its version
+# when it checks for updates.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -24,6 +30,8 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYSIDE_VERSION="${PYSIDE_VERSION:-6.12.0}"
 NUMPY_VERSION="${NUMPY_VERSION:-2.5.5}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+SIGN_KEYCHAIN="${SIGN_KEYCHAIN:-}"
+BLURT_COMMIT="${BLURT_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
 ARCH="$(uname -m)"
 
 step() { echo; echo "== $* =="; }
@@ -105,7 +113,7 @@ echo "Runs on macOS $MIN_MACOS and later"
 
 step "Adding Blurt"
 mkdir -p "$R/app"
-cp "$ROOT/blurt.py" "$ROOT/LICENSE" "$R/app/"
+cp "$ROOT/blurt.py" "$ROOT/blurt_update.py" "$ROOT/LICENSE" "$R/app/"
 rsync -a --exclude __pycache__ --exclude '*.pyc' "$ROOT/blurt_voice" "$ROOT/blurt_mac" "$R/app/"
 cp "$BUILD/libblurtaudio.dylib" "$R/app/blurt_mac/"
 ditto "$BUILD/Blurt.driver" "$R/Blurt.driver"
@@ -131,6 +139,7 @@ cat > "$C/Info.plist" <<EOF
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>BlurtCommit</key><string>$BLURT_COMMIT</string>
     <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -138,7 +147,7 @@ cat > "$C/Info.plist" <<EOF
     <key>NSMicrophoneUsageDescription</key>
     <string>Blurt mixes your microphone with the sounds you play, so others hear both, and the voice changer and noise gate work on it.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>Blurt keeps the last few seconds of what your Mac plays, so you can clip it.</string>
+    <string>Blurt keeps the last few seconds of what your Mac plays, so you can clip it, and can pass an app such as Discord on to Blurt-Friends.</string>
 </dict>
 </plist>
 EOF
@@ -151,7 +160,8 @@ step "Precompiling Python files"
 # ---- signing --------------------------------------------------------------------------
 step "Signing (identity: $SIGN_IDENTITY)"
 SIGN=(codesign --force --sign "$SIGN_IDENTITY" --timestamp=none)
-if [ "$SIGN_IDENTITY" != "-" ]; then
+[ -n "$SIGN_KEYCHAIN" ] && SIGN+=(--keychain "$SIGN_KEYCHAIN")
+if [ -n "${NOTARY_PROFILE:-}" ]; then  # notarizing needs the hardened runtime and a timestamp
     SIGN=(codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime)
 fi
 # every library and program inside, innermost first
@@ -161,7 +171,10 @@ find "$R" -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \) -print0 |
     done
 find "$R/python/lib/$PYV/site-packages/PySide6/Qt/lib" -maxdepth 1 -name '*.framework' -print0 |
     while IFS= read -r -d '' f; do "${SIGN[@]}" "$f" >/dev/null; done
-"${SIGN[@]}" "$R/Blurt.driver"
+# The driver is loaded by Core Audio, not by Blurt: keep it ad-hoc unless it is a
+# Developer ID build, so macOS never has to judge a self-signed certificate there.
+if [ -n "${NOTARY_PROFILE:-}" ]; then "${SIGN[@]}" "$R/Blurt.driver"; else
+    codesign --force --sign - --timestamp=none "$R/Blurt.driver"; fi
 "${SIGN[@]}" --entitlements "$HERE/entitlements.plist" "$APP"
 codesign --verify --deep --strict "$APP"
 echo "Signature OK"
@@ -176,13 +189,11 @@ ditto "$APP" "$STAGE/Blurt.app"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -quiet -volname Blurt -srcfolder "$STAGE" -ov -format UDZO "$DMG"
 rm -rf "$STAGE"
-if [ "$SIGN_IDENTITY" != "-" ]; then
+if [ -n "${NOTARY_PROFILE:-}" ]; then
     codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG"
-    if [ -n "${NOTARY_PROFILE:-}" ]; then
-        step "Notarizing (this can take a few minutes)"
-        xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
-        xcrun stapler staple "$DMG"
-    fi
+    step "Notarizing (this can take a few minutes)"
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
 fi
 
 echo

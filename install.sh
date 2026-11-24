@@ -41,7 +41,7 @@ command -v pactl >/dev/null || echo "Warning: 'pactl' not found - the virtual mi
 
 mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR"
 if [ "$HERE" != "$APP_DIR" ]; then  # (when repairing, the installer runs from APP_DIR itself)
-    cp "$HERE/blurt.py" "$APP_DIR/blurt.py"
+    cp "$HERE/blurt.py" "$HERE/blurt_update.py" "$APP_DIR/"
     rm -rf "$APP_DIR/blurt_voice"
     cp -r "$HERE/blurt_voice" "$APP_DIR/blurt_voice"
     cp "$HERE/install.sh" "$APP_DIR/install.sh"
@@ -50,6 +50,12 @@ OPTS=()
 [ "$GPU" = 1 ] && OPTS=(--ai-voice-gpu)
 [ "$GPU" = 0 ] && [ "$AI_VOICE" = 1 ] && OPTS=(--ai-voice)
 echo "${OPTS[*]+"${OPTS[*]}"}" > "$OPTIONS_FILE"
+# Which version this is, so Blurt can tell when GitHub has a newer one. (The in-app updater
+# passes BLURT_COMMIT; a git clone knows its own.)
+COMMIT="${BLURT_COMMIT:-}"
+if [ -z "$COMMIT" ] && [ "$HERE" != "$APP_DIR" ] && command -v git >/dev/null; then
+    COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || true)"
+fi
 
 # ---- uv: a small, self-contained tool that provides Python and installs packages ----------
 UV="$APP_DIR/bin/uv"
@@ -119,10 +125,14 @@ if [ "$AI_VOICE" = 1 ]; then
         [ "$INSTALLED" = 1 ] || echo "The ROCm build could not be installed; using the CPU build."
         if [ -e /dev/kfd ] && { [ ! -r /dev/kfd ] || [ ! -w /dev/kfd ]; }; then
             echo "Note: the graphics card may need your user in the 'render' group:"
-            echo "    sudo usermod -aG render,video $USER   (then log out and back in)"
+            echo "    sudo usermod -aG render,video ${USER:-$(id -un)}   (then log out and back in)"
         fi
     fi
     if [ "$INSTALLED" = 0 ]; then
+        # switching back from the graphics card build: pip would keep it (same version number)
+        if [ "$GPU" = 0 ] && "$PY" -c "import torch, sys; sys.exit(0 if torch.version.hip else 1)" 2>/dev/null; then
+            "$UV" pip uninstall --python "$PY" torch >/dev/null 2>&1 || true
+        fi
         step "Installing the AI voice engine: PyTorch for CPU (about 200 MB)"
         if ! pkg --upgrade torch --index-url https://download.pytorch.org/whl/cpu; then
             echo "The small CPU-only PyTorch download failed; installing the default build instead"
@@ -134,6 +144,8 @@ if [ "$AI_VOICE" = 1 ]; then
     pkg --upgrade transformers scipy faiss-cpu
     if [ "$GPU" = 1 ]; then
         step "Checking the graphics card"
+        echo "(A line saying \"(null): No such file or directory\" is a harmless warning from AMD's"
+        echo " graphics library: it only means it could not look up the card's marketing name.)"
         "$PY" -W ignore - <<'PY' || true
 import os, sys
 sys.path.insert(0, os.path.expanduser(os.environ.get("XDG_DATA_HOME", "~/.local/share")) + "/blurt")
@@ -192,6 +204,8 @@ Categories=AudioVideo;Audio;
 Terminal=false
 EOF
 
+if [ -n "$COMMIT" ]; then echo "$COMMIT" > "$APP_DIR/version"; fi  # (only once all went well)
+
 echo
 echo "Done. Start it from your app menu (Blurt) or run: $BIN_DIR/blurt"
 if [ "$AI_VOICE" = 0 ] && ! "$PY" -c "import torch" 2>/dev/null; then
@@ -200,5 +214,5 @@ fi
 if ! id -nG | tr ' ' '\n' | grep -qx input; then
     echo
     echo "For hotkeys that work while a game is focused, run this once and then log out/in:"
-    echo "    sudo usermod -aG input $USER"
+    echo "    sudo usermod -aG input ${USER:-$(id -un)}"
 fi

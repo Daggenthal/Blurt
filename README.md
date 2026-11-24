@@ -73,11 +73,11 @@ sudo usermod -aG input $USER
 
 On SteamOS you need to set a password with `passwd` first. Without this step, hotkeys only work while the Blurt window is focused.
 
-To update, pull the latest version and run `bash install.sh` again. Your sounds, folders and hotkeys are kept.
+Blurt updates itself: when a newer version is on GitHub, an **Update available** button appears at the bottom of the window (or use **Help > Check for updates**). It downloads the new version, runs the installer with the options you used last time, and restarts. Your sounds, folders and hotkeys are kept. Updating by hand still works too: pull the latest version and run `bash install.sh` again.
 
 ## Install on macOS
 
-Open `Blurt-<version>.dmg` and drag **Blurt** into **Applications**. To build the app yourself instead (needs the Xcode command line tools, `xcode-select --install`):
+Download **Blurt-macos-arm64.dmg** from the [latest Mac build](https://github.com/Daggenthal/Blurt/releases/tag/mac-latest), open it and drag **Blurt** into **Applications**. GitHub builds it for every change, for Apple silicon Macs. To build the app yourself instead (needs the Xcode command line tools, `xcode-select --install`):
 
 ```bash
 git clone https://github.com/Daggenthal/blurt.git
@@ -97,9 +97,11 @@ The first time you start Blurt, it offers to install its virtual microphone driv
 
 If you said no to one of them, turn it on later in **System Settings > Privacy & Security**. Global hotkeys start working as soon as you allow Input Monitoring, without restarting Blurt.
 
+The GitHub builds are signed with Blurt's own certificate rather than an Apple Developer ID, so the first time you open a downloaded copy macOS may say it is from an unidentified developer: go to **System Settings > Privacy & Security** and click **Open Anyway**. Updates installed by Blurt itself do not ask again.
+
 A self-built app is signed only for the Mac it was built on. To share it without macOS's "unidentified developer" warning, build it with a Developer ID (see the top of `macos/build_app.sh`). Otherwise, the first time the app is opened on another Mac, go to **System Settings > Privacy & Security** and click **Open Anyway**. macOS also treats every self-built version as a new app, so after rebuilding you have to allow its permissions again (an app signed with a Developer ID keeps them across updates).
 
-To update, replace Blurt.app with the new version. Your sounds, folders and hotkeys are kept. If the new version comes with a newer driver, Blurt offers to install it.
+Blurt updates itself from the latest Mac build: when one is available, an **Update available** button appears (or use **Blurt > Check for updates**). Blurt downloads it, checks that it is signed by the same certificate, then restarts as the new version. Your sounds, folders and hotkeys are kept, and so are macOS's permissions, because every build is signed the same way. If the new version comes with a newer driver, Blurt offers to install it. (Updating a self-built copy replaces it with GitHub's build; the first such update asks for the permissions once more.)
 
 To remove Blurt completely, delete Blurt.app and `~/Library/Application Support/Blurt`, then remove the driver:
 
@@ -140,13 +142,9 @@ If the live AI voice skips, **Performance details** in the Voice window shows wh
 
 AI voices run on the CPU by default. Newer CPUs with AVX-512 BF16 (for example Ryzen 7000 and later) use a faster maths mode automatically. Live AI voices have roughly half a second to a second of delay, depending on your hardware and the responsiveness setting.
 
-For much faster AI voices on an AMD graphics card, install the ROCm build instead (a download of several GB):
+The Voice window shows the graphics card Blurt found, which AI engine is installed, and whether voices run on the graphics card or the CPU (and if the CPU, why). Its buttons install the AI engine: the CPU version, or for much faster AI voices on an AMD graphics card, the graphics card (ROCm) version, a download of several GB. You can switch between the two the same way. From a terminal, the same is `bash install.sh --ai-voice` or `bash install.sh --ai-voice-gpu`.
 
-```bash
-bash install.sh --ai-voice-gpu
-```
-
-Then tick **Use the graphics card** in the Voice window. This has not been tested on the Steam Machine's GPU yet; if it does not work, Blurt falls back to the CPU. Blurt loads `.pth` files in PyTorch's safe mode, which refuses files that contain code.
+With the graphics card version installed, tick **Use the graphics card** in the Voice window. This has not been tested on the Steam Machine's GPU yet; if it does not work, Blurt falls back to the CPU. Blurt loads `.pth` files in PyTorch's safe mode, which refuses files that contain code.
 
 On a Mac, **Use the graphics card** uses the Mac's graphics chip through Metal; nothing extra needs installing. If it does not work, Blurt falls back to the CPU, which on Apple silicon uses the performance cores.
 

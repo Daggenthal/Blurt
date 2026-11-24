@@ -1,0 +1,75 @@
+# Builds Blurt.app for every push to main and publishes it as the release "mac-latest",
+# where Blurt's updater (blurt_update.py) finds it.
+#
+# Signing: with the repository secrets MAC_CERT_P12 (a base64 .p12 with a code signing
+# certificate and its key) and MAC_CERT_PASSWORD, every build is signed by the same
+# certificate, so macOS keeps Blurt's permissions across updates and the updater can check
+# that a download really is Blurt. Without them, builds are signed ad-hoc.
+name: Mac app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mac-app
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15  # Apple silicon
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Signing certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MAC_CERT_P12" ]; then
+            echo "::warning::No MAC_CERT_P12 secret: the app is signed ad-hoc."
+            exit 0
+          fi
+          KC="$RUNNER_TEMP/blurt-signing.keychain-db"
+          KP="$(uuidgen)"
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KC" >/dev/null
+          # (a self-signed certificate is not "valid" to macOS, so no -v here; codesign
+          # still signs with it)
+          ID="$(security find-identity -p codesigning "$KC" | awk '/\)/{print $2; exit}')"
+          [ -n "$ID" ] || { echo "No signing identity in the certificate"; exit 1; }
+          echo "SIGN_IDENTITY=$ID" >> "$GITHUB_ENV"
+          echo "SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          BLURT_COMMIT: ${{ github.sha }}
+        run: bash macos/build_app.sh
+
+      - name: Package
+        run: |
+          ARCH="$(uname -m)"
+          ditto -c -k --keepParent dist/Blurt.app "dist/Blurt-macos-$ARCH.zip"
+          mv dist/Blurt-*-"$ARCH".dmg "dist/Blurt-macos-$ARCH.dmg"
+          codesign -d -r- dist/Blurt.app
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mac-latest --cleanup-tag --yes || true
+          gh release create mac-latest dist/Blurt-macos-*.zip dist/Blurt-macos-*.dmg \
+            --target "$GITHUB_SHA" --title "Blurt for Mac (latest build)" --latest \
+            --notes "Built from ${GITHUB_SHA::7}: $(git log -1 --format=%s)
+
+          Download **Blurt-macos-arm64.dmg** (Apple silicon), open it and drag Blurt into Applications. The first time, macOS may say it is from an unidentified developer: go to System Settings > Privacy & Security and click Open Anyway. After that, Blurt updates itself."

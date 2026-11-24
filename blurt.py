@@ -65,6 +65,9 @@ from PySide6.QtMultimedia import (QAudioDecoder, QAudioFormat, QAudioOutput, QMe
 
 if IS_MAC:
     from blurt_mac import audio as macaudio, keys as mackeys, sysinfo as macsysinfo
+import blurt_update  # noqa: E402
+
+RESTART_CMD = None  # set by the updater: Blurt starts this when it quits
 
 APP = "Blurt"
 MIX_SINK, MIX_DESC = "blurt_mix", "Blurt-Internal-Mix"
@@ -2700,9 +2703,24 @@ class VoiceDialog(QtWidgets.QDialog):
         self.resp.setCurrentIndex(max(0, self.resp.findData(self.cfg["responsiveness"])))
         self.resp.activated.connect(self._resp_changed)
         form.addRow("Live responsiveness:", self.resp)
+        self.engine_label = W.QLabel()
+        self.engine_label.setWordWrap(True)
+        self.engine_label.setTextFormat(Qt.RichText)
+        form.addRow("AI engine:", self.engine_label)
+        erow = W.QHBoxLayout()
+        self.engine_cpu_btn = W.QPushButton()
+        self.engine_cpu_btn.clicked.connect(lambda: self._install_engine(gpu=False))
+        self.engine_gpu_btn = W.QPushButton()
+        self.engine_gpu_btn.clicked.connect(lambda: self._install_engine(gpu=True))
+        erow.addWidget(self.engine_cpu_btn)
+        erow.addWidget(self.engine_gpu_btn)
+        erow.addStretch(1)
+        form.addRow("", erow)
+        self._gpus = None
         self.gpu_box = W.QCheckBox("Use the graphics card when it works (much faster)")
         self.gpu_box.setToolTip("Uses the Mac's graphics chip (Metal)." if IS_MAC else
-                                "AMD cards need the GPU build: bash install.sh --ai-voice-gpu")
+                                "AMD cards need the graphics card version of the AI engine "
+                                "(the button above installs it).")
         self.gpu_box.setChecked(self.cfg.get("use_gpu", True))
         self.fast_box = W.QCheckBox("Fast maths (bfloat16 on newer CPUs, float16 on GPUs)")
         self.fast_box.setChecked(self.cfg.get("fast_math", True))
@@ -2710,6 +2728,7 @@ class VoiceDialog(QtWidgets.QDialog):
             box.toggled.connect(lambda on, k=key: self._engine_option(k, on))
             form.addRow("", box)
         lay.addWidget(self.ai_box)
+        self._refresh_engine()
 
         # testing
         test = W.QGroupBox("Test - record yourself and hear the result (nobody else hears it)")
@@ -3258,6 +3277,95 @@ class VoiceDialog(QtWidgets.QDialog):
         remove.clicked.connect(do_remove)
         dlg.exec()
 
+    # ---- AI engine: what runs where, and installing it --------------------------------------
+    def _refresh_engine(self):
+        if self._gpus is None:
+            try:
+                self._gpus = detect_gpus()
+            except (OSError, subprocess.SubprocessError):
+                self._gpus = []
+        gpus = ", ".join(self._gpus) or "none found"
+        build, text = torch_build()
+        h = self.helpers
+        if build == "none":
+            runs = "nothing yet: install the AI voice engine first"
+        elif h is None:
+            runs = "not started yet (it starts when you pick an AI voice)"
+        elif getattr(h, "device", "cpu") in ("cuda", "mps"):
+            runs = f"<b>the graphics card</b> ({getattr(h, 'gpu_name', '') or gpus})"
+        else:
+            why = getattr(h, "gpu_error", "")
+            runs = "<b>the CPU</b>" + (f". Graphics card not used: {why}" if why else "")
+        self.engine_label.setText(f"Graphics: {gpus}<br>Installed: {text}<br>Runs on: {runs}")
+        if IS_MAC:  # one build; it uses Metal when it can
+            self.engine_gpu_btn.hide()
+            self.engine_cpu_btn.setText("Install the AI voice engine (about 500 MB)")
+            self.engine_cpu_btn.setVisible(build == "none")
+            return
+        ok, why = blurt_update.can_install()
+        amd = any(g.startswith("AMD") for g in self._gpus)
+        self.engine_cpu_btn.setText("Install for the CPU (about 1 GB)" if build == "none"
+                                    else "Switch to the CPU version")
+        self.engine_gpu_btn.setText(
+            ("Install the" if build == "none" else "Switch to the") +
+            " graphics card version (AMD, several GB)")
+        self.engine_cpu_btn.setVisible(build != "cpu")
+        self.engine_gpu_btn.setVisible(build != "rocm")
+        self.engine_cpu_btn.setEnabled(ok)
+        self.engine_gpu_btn.setEnabled(ok and amd)
+        self.engine_cpu_btn.setToolTip(why)
+        self.engine_gpu_btn.setToolTip(why or ("" if amd else
+                                               "No AMD graphics card was found in this computer."))
+
+    def _install_engine(self, gpu):
+        if IS_MAC:
+            self._install_ai_mac(self._model())
+            return
+        flag = "--ai-voice-gpu" if gpu else "--ai-voice"
+        what = ("the graphics card version (PyTorch for AMD cards, several GB)" if gpu else
+                "the CPU version (PyTorch for the CPU, about 1 GB)")
+        if QtWidgets.QMessageBox.question(
+                self, "AI voice engine", f"Install {what}?\n\nIt is downloaded once; this "
+                "can take a while. Blurt keeps running, and live voices pause meanwhile."
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        self.helpers = None  # the engine restarts with the new PyTorch
+        self.voices.clear()
+        self.win.live.stop()
+        self.client.stop()
+        self.win.update_mic_pipeline()
+        dlg = TaskDialog(self, "Installing the AI voice engine",
+                         f"Installing {what} with Blurt's installer (install.sh {flag}). It "
+                         "also checks the graphics card at the end.")
+
+        def work(log, _progress):
+            proc = subprocess.Popen(["bash", str(blurt_update.LINUX_APP_DIR / "install.sh"), flag],
+                                    cwd=blurt_update.LINUX_APP_DIR, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL)
+            for line in proc.stdout:
+                log(line.rstrip())
+            if proc.wait() != 0:
+                raise blurt_update.UpdateError("The installer failed (see the messages above).")
+
+        def done(_result, error):
+            import importlib
+            importlib.invalidate_caches()
+            self._refresh_engine()
+            if error:
+                dlg.label.setText(f"<b>Installing did not finish.</b> {error}")
+                return
+            if gpu:
+                self.gpu_box.setChecked(True)
+            dlg.label.setText("<b>Installed.</b> Pick an AI voice to start the engine; the Voice "
+                              "window then shows whether it runs on the graphics card. Blurt's "
+                              "installer may also have updated Qt: restarting Blurt is safest.")
+            dlg.extra.setText("Restart Blurt now")
+            dlg.extra.show()
+            dlg.extra.clicked.connect(lambda: restart_blurt(blurt_update.restart_command()))
+        dlg.run(work, done)
+        dlg.exec()
+
     # ---- AI loading ------------------------------------------------------
     def _install_ai_mac(self, model):
         """The Mac app installs the AI voice engine itself, next to Blurt's settings (the
@@ -3303,7 +3411,9 @@ class VoiceDialog(QtWidgets.QDialog):
                 self.status.setText(f"Installing the AI voice engine failed:\n{error}")
                 return
             self.status.setText("The AI voice engine is installed.")
-            self._prepare_ai(model)
+            self._refresh_engine()
+            if model:
+                self._prepare_ai(model)
 
         Background(self, work, finished, self.status.setText)
 
@@ -3316,8 +3426,8 @@ class VoiceDialog(QtWidgets.QDialog):
             return
         if not ai_voice_installed():
             self.status.setText(
-                "AI voices need extra components (PyTorch, about 1 GB). Install them once "
-                "with:\n    bash install.sh --ai-voice\nthen restart Blurt.")
+                "AI voices need the AI voice engine (PyTorch). Install it with one of the "
+                "buttons next to “AI engine” in this window.")
             return
         if self._ai_ready(model) or self.loading:
             if self._ai_ready(model):
@@ -3369,6 +3479,7 @@ class VoiceDialog(QtWidgets.QDialog):
                 if getattr(voice, "describe", None) and self.helpers is not None:
                     self.helpers._describe = voice.describe  # after GPU tuning
                 pick = self._auto_responsiveness()
+                self._refresh_engine()
                 if self.cfg.get("use_gpu", True) and self.helpers.device not in ("cuda", "mps"):
                     note += f" (graphics card not used: {self.helpers.gpu_error})"
                 self.status.setText(
@@ -3413,6 +3524,7 @@ class VoiceDialog(QtWidgets.QDialog):
         self.voices.clear()
         self.win.live.stop()
         self.client.stop()  # a fresh engine process picks up the new option
+        self._refresh_engine()
         self.win.update_mic_pipeline()  # normal (gated) mic while the engine reloads
         model = self._model()
         if model:
@@ -4203,6 +4315,265 @@ ACTIONS = {"stop": "Stop", "pause": "Pause / resume", "random": "Play random sou
            "relay": "Relay to Blurt-Friends on/off"}
 
 
+# --------------------------------------------------------------------------
+# Graphics card and AI engine build (shown in the Voice window)
+# --------------------------------------------------------------------------
+def detect_gpus():
+    """Names of the graphics chips in this computer, e.g. ["AMD Radeon 780M"]."""
+    if IS_MAC:
+        brand = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                               text=True).stdout.strip()
+        return [f"{brand or 'Apple'} graphics (Metal)"]
+    makers = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
+    found = []
+    for card in sorted(glob.glob("/sys/class/drm/card*")):
+        if not re.fullmatch(r"card\d+", os.path.basename(card)):
+            continue  # (connectors such as card0-DP-1)
+        dev = Path(card) / "device"
+        try:
+            vendor = (dev / "vendor").read_text().strip()
+            device = (dev / "device").read_text().strip()
+        except OSError:
+            continue
+        maker = makers.get(vendor)
+        if not maker:
+            continue
+        name = ""
+        try:
+            name = (dev / "product_name").read_text().strip()
+        except OSError:
+            pass
+        if not name and shutil.which("lspci"):
+            out = subprocess.run(["lspci", "-mm", "-d", f"{vendor[2:]}:{device[2:]}"],
+                                 capture_output=True, text=True).stdout
+            fields = re.findall(r'"([^"]*)"', out.splitlines()[0]) if out.strip() else []
+            if len(fields) >= 3:
+                name = fields[2]
+        label = f"{maker} {name}" if name and maker.lower() not in name.lower() else name
+        found.append(label or f"{maker} graphics ({device})")
+    return list(dict.fromkeys(found))
+
+
+def torch_build():
+    """("none" | "cpu" | "rocm" | "cuda" | "metal", text) for the installed PyTorch."""
+    from importlib import metadata
+    try:
+        v = metadata.version("torch")
+    except metadata.PackageNotFoundError:
+        return "none", "not installed"
+    if IS_MAC:
+        return "metal", f"PyTorch {v} (can use the graphics chip through Metal)"
+    if "rocm" in v:
+        return "rocm", f"PyTorch {v}, the version for AMD graphics cards (ROCm)"
+    if "+cpu" in v:
+        return "cpu", f"PyTorch {v}, the CPU-only version"
+    return "cuda", f"PyTorch {v}, the version for NVIDIA graphics cards (CUDA)"
+
+
+# --------------------------------------------------------------------------
+# Long jobs with visible output (updates, installing the AI engine)
+# --------------------------------------------------------------------------
+class TaskDialog(QtWidgets.QDialog):
+    """Runs fn(log, progress) on a background thread and shows what it prints."""
+    _log = QtCore.Signal(str)
+    _progress = QtCore.Signal(str, int, int)
+    _done = QtCore.Signal(object, object)  # result, error message (None = success)
+
+    def __init__(self, parent, title, intro):
+        super().__init__(parent)
+        W = QtWidgets
+        self.setWindowTitle(title)
+        self.resize(720, 460)
+        lay = W.QVBoxLayout(self)
+        self.label = W.QLabel(intro)
+        self.label.setWordWrap(True)
+        lay.addWidget(self.label)
+        self.bar = W.QProgressBar()
+        self.bar.hide()
+        lay.addWidget(self.bar)
+        self.text = W.QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMaximumBlockCount(5000)
+        self.text.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        lay.addWidget(self.text, 1)
+        row = W.QHBoxLayout()
+        row.addStretch(1)
+        self.extra = W.QPushButton()
+        self.extra.hide()
+        row.addWidget(self.extra)
+        self.close_btn = W.QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        row.addWidget(self.close_btn)
+        lay.addLayout(row)
+        self.running = False
+        self._log.connect(self.text.appendPlainText)
+        self._progress.connect(self._show_progress)
+
+    def _show_progress(self, what, done, total):
+        self.bar.show()
+        mb = done / 1048576
+        if total:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(int(1000 * done / total))
+            self.bar.setFormat(f"{what} {mb:.0f} of {total / 1048576:.0f} MB")
+        else:
+            self.bar.setRange(0, 0)
+            self.bar.setFormat(f"{what} {mb:.0f} MB")
+
+    def run(self, fn, on_done):
+        self.running = True
+        self.close_btn.setEnabled(False)
+
+        def finished(result, error):
+            self.running = False
+            self.close_btn.setEnabled(True)
+            self.bar.hide()
+            on_done(result, error)
+        self._done.connect(finished)
+
+        def work():
+            try:
+                result = fn(self._log.emit, self._progress.emit)
+                self._done.emit(result, None)
+            except blurt_update.UpdateError as e:
+                self._done.emit(None, str(e))
+            except Exception as e:  # shown to the user
+                self._done.emit(None, f"{type(e).__name__}: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def reject(self):
+        if not self.running:  # (no closing halfway through an install)
+            super().reject()
+
+    def closeEvent(self, ev):
+        if self.running:
+            ev.ignore()
+        else:
+            super().closeEvent(ev)
+
+
+def _short(sha):
+    return sha[:7] if sha else "unknown"
+
+
+def _when(iso):
+    try:
+        t = time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")
+        return time.strftime("%d %b %Y", t)
+    except (TypeError, ValueError):
+        return ""
+
+
+class UpdateDialog(QtWidgets.QDialog):
+    """Shows what is new on GitHub and installs it."""
+
+    def __init__(self, win, info=None):
+        super().__init__(win)
+        W = QtWidgets
+        self.win = win
+        self.info = info
+        self.setWindowTitle("Blurt updates")
+        self.resize(600, 420)
+        lay = W.QVBoxLayout(self)
+        self.label = W.QLabel("Checking GitHub for a newer version…")
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.RichText)
+        lay.addWidget(self.label)
+        self.changes = W.QPlainTextEdit()
+        self.changes.setReadOnly(True)
+        self.changes.hide()
+        lay.addWidget(self.changes, 1)
+        cfg = win.store.settings.setdefault("updates", {"auto": True})
+        self.auto = W.QCheckBox("Check for updates automatically")
+        self.auto.setChecked(cfg.get("auto", True))
+        self.auto.toggled.connect(lambda on: (cfg.__setitem__("auto", on), win.store.save()))
+        lay.addWidget(self.auto)
+        row = W.QHBoxLayout()
+        row.addStretch(1)
+        self.check_btn = W.QPushButton("Check again")
+        self.check_btn.clicked.connect(self.check)
+        self.update_btn = W.QPushButton("Update now")
+        self.update_btn.setEnabled(False)
+        self.update_btn.clicked.connect(self.install)
+        close = W.QPushButton("Close")
+        close.clicked.connect(self.reject)
+        for b in (self.check_btn, self.update_btn, close):
+            row.addWidget(b)
+        lay.addLayout(row)
+        if info:
+            self.show_info(info, None)
+        else:
+            self.check()
+
+    def check(self):
+        self.check_btn.setEnabled(False)
+        self.update_btn.setEnabled(False)
+        self.label.setText("Checking GitHub for a newer version…")
+        Background(self, lambda _p: blurt_update.check(), self.show_info)
+
+    def show_info(self, info, error):
+        self.check_btn.setEnabled(True)
+        here = f"This version: <b>{_short(blurt_update.current_commit())}</b>"
+        if error:
+            self.label.setText(f"{here}<br><br>{error}")
+            return
+        self.info = info
+        self.win.set_update_available(info)
+        if not info["available"]:
+            self.changes.hide()
+            self.label.setText(f"{here}<br><br>" + (info["note"] or "Blurt is up to date."))
+            return
+        n = info["behind"]
+        what = f"{n} change{'s' if n != 1 else ''}" if n else "Changes"
+        self.label.setText(f"{here}<br>Newest version: <b>{_short(info['latest'])}</b> "
+                           f"({_when(info['date'])})<br><br>{what} since your version:")
+        self.changes.setPlainText("\n".join(f"• {title}" for _sha, title in info["changes"]))
+        self.changes.show()
+        ok, why = blurt_update.can_install()
+        self.update_btn.setEnabled(ok)
+        self.update_btn.setToolTip(why)
+        if not ok:
+            self.label.setText(self.label.text() + f"<br><i>{why}</i>")
+
+    def install(self):
+        info = self.info
+        self.accept()
+        if IS_MAC:
+            intro = ("Downloading the new Blurt.app. When it is ready, Blurt quits and opens the "
+                     "new version. If it comes with a newer audio driver, Blurt asks to install "
+                     "it, and macOS asks for your password.")
+            fn = lambda log, progress: blurt_update.prepare_mac(info, log, progress)  # noqa: E731
+        else:
+            intro = ("Downloading the new version and running its installer, with the options you "
+                     "used last time. Updating Qt or PyTorch can take a few minutes.")
+            fn = lambda log, progress: blurt_update.install_linux(info, log, progress)  # noqa: E731
+        dlg = TaskDialog(self.win, "Updating Blurt", intro)
+
+        def done(result, error):
+            if error:
+                dlg.label.setText(f"<b>The update did not finish.</b> {error}")
+                return
+            if IS_MAC:
+                dlg.label.setText("The new version is ready. Blurt now restarts.")
+                blurt_update.start_detached(result)
+                QtCore.QTimer.singleShot(800, QtWidgets.QApplication.quit)
+                return
+            dlg.label.setText("<b>Blurt is updated.</b> Restart it to use the new version.")
+            dlg.extra.setText("Restart Blurt now")
+            dlg.extra.show()
+            dlg.extra.clicked.connect(lambda: restart_blurt(blurt_update.restart_command()))
+            self.win.set_update_available(None)
+        dlg.run(fn, done)
+        dlg.exec()
+
+
+def restart_blurt(cmd):
+    global RESTART_CMD
+    RESTART_CMD = cmd
+    QtWidgets.QApplication.quit()
+
+
+
 class AppCombo(QtWidgets.QComboBox):
     """A combo box that asks for fresh items each time it opens."""
     opening = QtCore.Signal()
@@ -4214,6 +4585,7 @@ class AppCombo(QtWidgets.QComboBox):
 
 class MainWindow(QtWidgets.QMainWindow):
     relay_result = QtCore.Signal(str, str)  # state, text (from the background check)
+    update_checked = QtCore.Signal(object)  # blurt_update.check() result, None on failure
 
     def __init__(self, store, router, engine, keys):
         super().__init__()
@@ -4413,6 +4785,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.route_label = W.QLabel(self.router.message)
         self.statusBar().addPermanentWidget(self.route_label)
+        self._build_update_ui()
         if not self.keys.available and IS_MAC:
             self.statusBar().showMessage(
                 "For hotkeys in other apps, allow Blurt in Privacy & Security > Input Monitoring.")
@@ -4422,6 +4795,59 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "Hotkeys only work while this window is focused. For global hotkeys: "
                 "sudo usermod -aG input $USER, then log out and back in.")
+
+    # ---- updates ---------------------------------------------------------------------------
+    def _build_update_ui(self):
+        help_menu = self.menuBar().addMenu("Help")
+        check = help_menu.addAction("Check for updates…")
+        check.setMenuRole(QtGui.QAction.ApplicationSpecificRole)  # (macOS: in the app menu)
+        check.triggered.connect(lambda: UpdateDialog(self).exec())
+        about = help_menu.addAction("About Blurt")
+        about.setMenuRole(QtGui.QAction.AboutRole)
+        about.triggered.connect(self._about)
+        self.update_btn = QtWidgets.QPushButton("⬆ Update available")
+        self.update_btn.setFlat(True)
+        self.update_btn.setStyleSheet("font-weight: bold")
+        self.update_btn.hide()
+        self.update_btn.clicked.connect(
+            lambda: UpdateDialog(self, getattr(self, "_update_info", None)).exec())
+        self.statusBar().addPermanentWidget(self.update_btn)
+        self.update_checked.connect(self.set_update_available)
+        self.update_timer = QtCore.QTimer(self)
+        self.update_timer.timeout.connect(self._auto_check)
+        self.update_timer.start(6 * 3600 * 1000)
+        QtCore.QTimer.singleShot(8000, self._auto_check)
+
+    def _auto_check(self):
+        if not self.store.settings.setdefault("updates", {"auto": True}).get("auto", True):
+            return
+
+        def work():
+            try:
+                self.update_checked.emit(blurt_update.check())
+            except blurt_update.UpdateError:
+                pass  # offline etc.: try again later, quietly
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_update_available(self, info):
+        if info and info.get("available"):
+            self._update_info = info
+            n = info.get("behind")
+            self.update_btn.setToolTip(f"{n} new change{'s' if n != 1 else ''} on GitHub"
+                                       if n else "A newer version is on GitHub")
+            self.update_btn.show()
+        else:
+            self._update_info = None
+            self.update_btn.hide()
+
+    def _about(self):
+        sha = blurt_update.current_commit()
+        QtWidgets.QMessageBox.about(
+            self, "About Blurt",
+            f"<b>Blurt</b><br>Version {_short(sha)}<br><br>A soundboard that plays audio "
+            "through your microphone, for Linux and macOS.<br><br>"
+            f'<a href="https://github.com/{blurt_update.REPO}">github.com/{blurt_update.REPO}</a>'
+            "<br>MIT License")
 
     # ---- relay: an app (e.g. your Discord friends) into Blurt-Friends -----------------------
     def _relay_cfg(self):
@@ -5287,7 +5713,11 @@ def main():
     tick = QtCore.QTimer()
     tick.timeout.connect(lambda: None)  # lets Python handle Ctrl+C
     tick.start(300)
-    sys.exit(app.exec())
+    code = app.exec()
+    if RESTART_CMD:  # updated: start the new version (atexit handlers first: execv skips them)
+        atexit._run_exitfuncs()
+        os.execv(RESTART_CMD[0], RESTART_CMD)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
