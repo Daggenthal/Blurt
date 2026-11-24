@@ -8,6 +8,11 @@
 # Blurt brings its own Python (via uv) instead of using the system one, so SteamOS updates
 # that change or strip the system Python cannot break it.
 set -euo pipefail
+if [ "$(uname -s)" = Darwin ]; then
+    echo "This installer is for Linux. On macOS, build the app instead: bash macos/build_app.sh"
+    echo "(or open the Blurt .dmg and drag Blurt into Applications)."
+    exit 1
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/blurt"
 BIN_DIR="$HOME/.local/bin"

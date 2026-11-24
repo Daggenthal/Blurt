@@ -35,6 +35,13 @@ def main():
         return pickle.loads(inp.read(n))
 
     print(f"[engine] started, python {sys.version.split()[0]}", file=sys.stderr, flush=True)
+    if sys.platform == "darwin":
+        # Apple GPUs: run the few operations Metal lacks on the CPU instead of failing
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        # PyTorch and faiss each bring their own OpenMP runtime on macOS, and the second
+        # one aborts the process unless told this is fine. faiss runs on one thread
+        # (engine.set_threads), so its runtime stays idle and the two do not interfere.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     from . import engine
     import torch
     state = {"helpers": None, "voices": {}, "stream": None}
@@ -51,9 +58,9 @@ def main():
         state["fast_math"] = fast_math
         state["voices"].clear()
         gpu_name = ""
-        if device == "cuda":
+        if device in engine.GPU_DEVICES:
             try:
-                gpu_name = torch.cuda.get_device_name(0)
+                gpu_name = engine.gpu_name(device)
             except Exception:
                 pass
         return {"device": device, "describe": state["helpers"].describe(),

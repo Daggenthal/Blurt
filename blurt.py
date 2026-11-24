@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Blurt - a soundboard for Linux that plays audio files through your microphone.
+"""Blurt - a soundboard for Linux and macOS that plays audio files through your microphone.
 
-How it works (PipeWire / PulseAudio, via pactl):
-  * a virtual sink  "Blurt-Mix"  receives your real mic + the sounds you play
-  * a virtual mic   "Blurt-Mic"  exposes that mix; pick it in Discord / games
+How it works:
+  * a virtual output "Blurt-Mix"  receives your real mic + the sounds you play
+  * a virtual mic    "Blurt-Mic"  exposes that mix; pick it in Discord / games
   * every sound is also played to your chosen output so you can hear it
+
+On Linux the two devices are a PipeWire / PulseAudio sink and source made with pactl. On
+macOS they come from Blurt's own Core Audio driver, and the blurt_mac package stands in for
+pactl, pacat, parec and /dev/input.
 """
 import atexit
 import fcntl
@@ -28,7 +32,17 @@ from array import array
 from collections import deque
 from pathlib import Path
 
-os.environ.setdefault("QT_AUDIO_BACKEND", "pulseaudio")  # served by pipewire-pulse too
+IS_MAC = sys.platform == "darwin"
+if not IS_MAC:
+    os.environ.setdefault("QT_AUDIO_BACKEND", "pulseaudio")  # served by pipewire-pulse too
+
+if IS_MAC:
+    # The Mac app keeps optional extras (the AI voice engine) outside its signed bundle.
+    MAC_PACKAGES = Path.home() / "Library/Application Support/Blurt/python-packages"
+    if str(MAC_PACKAGES) not in sys.path:
+        sys.path.append(str(MAC_PACKAGES))
+        os.environ["PYTHONPATH"] = os.pathsep.join(  # ...and the voice engine process too
+            p for p in (os.environ.get("PYTHONPATH"), str(MAC_PACKAGES)) if p)
 
 try:
     import numpy as np  # only the editor's effects need it
@@ -45,6 +59,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtMultimedia import (QAudioDecoder, QAudioFormat, QAudioOutput, QMediaDevices,
                                    QMediaPlayer)
 
+if IS_MAC:
+    from blurt_mac import audio as macaudio, keys as mackeys, sysinfo as macsysinfo
+
 APP = "Blurt"
 MIX_SINK, MIX_DESC = "blurt_mix", "Blurt-Mix"
 MIC_SOURCE, MIC_DESC = "blurt_mic", "Blurt-Mic"
@@ -52,7 +69,10 @@ CAP_SINK, CAP_DESC = "blurt_capture", "Blurt-Clip-Buffer"
 AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4a", ".aac",
               ".wma", ".webm", ".mka", ".aiff", ".aif"}
 
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "blurt"
+if IS_MAC:
+    DATA_DIR = Path.home() / "Library/Application Support/Blurt"
+else:
+    DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "blurt"
 SOUNDS_DIR = DATA_DIR / "sounds"
 LIBRARY_FILE = DATA_DIR / "library.json"
 CLIPS_DIR = DATA_DIR / "clips"  # scratch space for the most recent clip
@@ -91,7 +111,8 @@ def combo_label(combo):
         return ""
     *mods, code = combo.split("+")
     order = [m for m in ("ctrl", "shift", "alt", "meta") if m in mods]
-    names = {"ctrl": "Ctrl", "shift": "Shift", "alt": "Alt", "meta": "Super"}
+    names = mackeys.MOD_LABELS if IS_MAC else {"ctrl": "Ctrl", "shift": "Shift", "alt": "Alt",
+                                               "meta": "Super"}
     key = KEY_NAMES.get(int(code), f"Key {code}")
     return "+".join([names[m] for m in order] + [key])
 
@@ -101,17 +122,23 @@ def combo_from_qt(ev):
     if ev.key() in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
                     Qt.Key_AltGr, Qt.Key_unknown):
         return None
-    code = ev.nativeScanCode() - 8
+    if IS_MAC:  # Mac key code, translated to the evdev code Blurt stores
+        code = mackeys.evdev_code(ev.nativeVirtualKey())
+    else:
+        code = ev.nativeScanCode() - 8
     if code <= 0 or code in MOD_CODES:
         return None
     m, mods = ev.modifiers(), []
-    if m & Qt.ControlModifier:
+    # Qt on macOS reports the Command key as Control and the Control key as Meta
+    ctrl, meta = (Qt.MetaModifier, Qt.ControlModifier) if IS_MAC else (Qt.ControlModifier,
+                                                                       Qt.MetaModifier)
+    if m & ctrl:
         mods.append("ctrl")
     if m & Qt.ShiftModifier:
         mods.append("shift")
     if m & Qt.AltModifier:
         mods.append("alt")
-    if m & Qt.MetaModifier:
+    if m & meta:
         mods.append("meta")
     return make_combo(mods, code)
 
@@ -195,6 +222,38 @@ class GlobalKeys(QtCore.QObject):
                     elif value == 1:
                         mods = {MOD_CODES[c] for c in self._mods}
                         self.pressed.emit(make_combo(mods, code))
+
+
+if IS_MAC:
+    def GlobalKeys():  # noqa: F811 - the macOS version (a keyboard event tap)
+        return mackeys.GlobalKeys(ignore=MOD_CODES)
+
+
+# --------------------------------------------------------------------------
+# Audio streams: pacat / parec on Linux, Core Audio (blurt_mac) on macOS.
+# Both return objects that look like a subprocess.Popen of pacat / parec.
+# --------------------------------------------------------------------------
+def open_playback(device, fmt, rate, channels, latency_ms, name, process_ms=None):
+    """A stream that plays the raw audio written to its .stdin."""
+    if IS_MAC:
+        return macaudio.Playback(device, fmt, rate, channels, latency_ms)
+    cmd = ["pacat", "--playback", f"--device={device}", f"--format={fmt}", f"--rate={rate}",
+           f"--channels={channels}", f"--latency-msec={latency_ms}"]
+    if process_ms:
+        cmd.append(f"--process-time-msec={process_ms}")
+    cmd += ["--raw", f"--client-name={name}"]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def open_recording(device, fmt, rate, channels, latency_ms, name):
+    """A stream whose .stdout delivers raw audio recorded from `device`."""
+    if IS_MAC:
+        return macaudio.Recording(device, fmt, rate, channels)
+    return subprocess.Popen(
+        ["parec", f"--device={device}", f"--format={fmt}", f"--rate={rate}",
+         f"--channels={channels}", f"--latency-msec={latency_ms}", "--raw",
+         f"--client-name={name}"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +352,10 @@ class Router:
         self.ok = False
 
 
+if IS_MAC:
+    from blurt_mac.routing import Router  # noqa: E402,F811 - Blurt's Core Audio driver
+
+
 class Clipper:
     """Keeps the last seconds of audio from a source (e.g. the monitor of your output)."""
     RATE, CHANNELS, MAX_SECONDS = 48000, 2, 30
@@ -304,7 +367,7 @@ class Clipper:
         self.chunks = deque()
         self.total = 0
         self.lock = threading.Lock()
-        self.available = shutil.which("parec") is not None
+        self.available = IS_MAC or shutil.which("parec") is not None
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
@@ -317,11 +380,8 @@ class Clipper:
         if not (source and self.available):
             return
         try:
-            self.proc = subprocess.Popen(
-                ["parec", f"--device={source}", "--format=s16le", f"--rate={self.RATE}",
-                 f"--channels={self.CHANNELS}", "--latency-msec=20", "--raw",
-                 "--client-name=Blurt clip buffer"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.proc = open_recording(source, "s16le", self.RATE, self.CHANNELS, 20,
+                                       "Blurt clip buffer")
         except OSError:
             self.proc = None
             return
@@ -344,6 +404,32 @@ class Clipper:
                 self.total += len(data)
                 while self.chunks and self.chunks[0][0] < now - self.MAX_SECONDS - 1:
                     self.chunks.popleft()
+        # On macOS a recording ends by itself when the output device or its sample rate
+        # changes (e.g. a Bluetooth headset switching modes); start a new one, keeping the
+        # audio recorded so far. (Not when it could not be opened at all, e.g. no permission.)
+        if IS_MAC and proc is self.proc and not getattr(proc, "error", ""):
+            threading.Timer(0.3, self._reopen, args=(proc,)).start()
+
+    def _reopen(self, old):
+        with self.lock:
+            if old is not self.proc:  # stopped or restarted meanwhile
+                return
+        try:
+            new = open_recording(self.source, "s16le", self.RATE, self.CHANNELS, 20,
+                                 "Blurt clip buffer")
+        except OSError:
+            return
+        with self.lock:
+            if old is not self.proc:
+                new.terminate()
+                return
+            self.proc = new
+            tail = self.total % self.FRAME
+            if tail:  # never let the old stream's last partial frame shift the new one
+                self.chunks.append((time.monotonic(), bytes(self.FRAME - tail)))
+                self.total += self.FRAME - tail
+        old.terminate()
+        threading.Thread(target=self._read, args=(new,), daemon=True).start()
 
     def stop(self):
         proc, self.proc = self.proc, None
@@ -674,15 +760,13 @@ class SoundOut:
         self.engine, self.name, self.sink = engine, name, sink
         self.gain = 1.0
         self.alive = True
-        self.proc = subprocess.Popen(
-            ["pacat", "--playback", f"--device={sink}", "--format=s16le", "--rate=48000",
-             "--channels=2", "--latency-msec=15", "--process-time-msec=5", "--raw",
-             f"--client-name=Blurt voice sound-{name}"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:  # keep the pipe tiny so nothing piles up in front of the sound server
-            fcntl.fcntl(self.proc.stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
-        except OSError:
-            pass
+        self.proc = open_playback(sink, "s16le", 48000, 2, 15, f"Blurt voice sound-{name}",
+                                  process_ms=5)
+        if not IS_MAC:  # (on macOS there is no pipe: writes go straight to Core Audio)
+            try:  # keep the pipe tiny so nothing piles up in front of the sound server
+                fcntl.fcntl(self.proc.stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+            except OSError:
+                pass
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -1946,8 +2030,12 @@ class SaveDialog(QtWidgets.QDialog):
 
 
 def show_in_file_manager(path):
-    """Open the file manager (Dolphin on KDE) at a folder, or with a file highlighted."""
+    """Open the file manager (Dolphin on KDE, Finder on macOS) at a folder, or with a file
+    highlighted."""
     path = Path(path)
+    if IS_MAC and path.exists():
+        subprocess.run(["open", "-R", str(path)] if path.is_file() else ["open", str(path)])
+        return
     if path.is_file() and shutil.which("dbus-send"):
         try:
             r = subprocess.run(
@@ -2056,11 +2144,7 @@ class PacatOut:
 
     def __init__(self, name, sink, kind):
         self.sink, self.kind = sink, kind
-        self.proc = subprocess.Popen(
-            ["pacat", "--playback", f"--device={sink}", "--format=float32le",
-             f"--rate={VOICE_RATE}", "--channels=1", "--latency-msec=30", "--raw",
-             f"--client-name=Blurt voice {name}"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.proc = open_playback(sink, "float32le", VOICE_RATE, 1, 30, f"Blurt voice {name}")
         self.queue = deque()
         self.queued = 0
         self.event = threading.Event()
@@ -2139,10 +2223,7 @@ class VoiceLive:
         self.blocks = self.max_queue = 0
         self.gen += 1
         self.running = True
-        self.reader = subprocess.Popen(
-            ["parec", f"--device={source}", "--format=float32le", f"--rate={VOICE_RATE}",
-             "--channels=1", "--latency-msec=10", "--raw", "--client-name=Blurt voice input"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.reader = open_recording(source, "float32le", VOICE_RATE, 1, 10, "Blurt voice input")
         threading.Thread(target=self._read, args=(self.reader, self.gen), daemon=True).start()
         if self.block:
             threading.Thread(target=self._work, args=(self.gen,), daemon=True).start()
@@ -2465,7 +2546,8 @@ class VoiceDialog(QtWidgets.QDialog):
         self.resp.activated.connect(self._resp_changed)
         form.addRow("Live responsiveness:", self.resp)
         self.gpu_box = W.QCheckBox("Use the graphics card when it works (much faster)")
-        self.gpu_box.setToolTip("AMD cards need the GPU build: bash install.sh --ai-voice-gpu")
+        self.gpu_box.setToolTip("Uses the Mac's graphics chip (Metal)." if IS_MAC else
+                                "AMD cards need the GPU build: bash install.sh --ai-voice-gpu")
         self.gpu_box.setChecked(self.cfg.get("use_gpu", True))
         self.fast_box = W.QCheckBox("Fast maths (bfloat16 on newer CPUs, float16 on GPUs)")
         self.fast_box.setChecked(self.cfg.get("fast_math", True))
@@ -3022,10 +3104,61 @@ class VoiceDialog(QtWidgets.QDialog):
         dlg.exec()
 
     # ---- AI loading ------------------------------------------------------
+    def _install_ai_mac(self, model):
+        """The Mac app installs the AI voice engine itself, next to Blurt's settings (the
+        app bundle stays unchanged, so its signature stays valid)."""
+        if getattr(self, "installing", False):
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Install the AI voice engine",
+                "AI voices need extra components (PyTorch and friends, about 500 MB). They are "
+                "downloaded once and kept in Blurt's folder.\n\nInstall them now?"
+        ) != QtWidgets.QMessageBox.Yes:
+            self.status.setText("The AI voice engine is needed before AI voices work.")
+            return
+        self.installing = True
+        self.status.setText("Installing the AI voice engine…")
+
+        def work(progress):
+            import tempfile
+            MAC_PACKAGES.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as c:
+                c.write(f"numpy=={np.__version__}\n")  # keep the numpy Blurt already uses
+            cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                   "--no-input", "--upgrade", "--target", str(MAC_PACKAGES),
+                   "--constraint", c.name, "torch", "transformers", "scipy", "faiss-cpu"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True)
+            tail = deque(maxlen=8)
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    tail.append(line)
+                    if line.startswith(("Collecting", "Downloading", "Installing")):
+                        progress("Installing the AI voice engine… " + line[:110])
+            os.unlink(c.name)
+            if proc.wait() != 0:
+                raise RuntimeError("\n".join(tail))
+
+        def finished(_result, error):
+            self.installing = False
+            import importlib
+            importlib.invalidate_caches()
+            if error or not ai_voice_installed():
+                self.status.setText(f"Installing the AI voice engine failed:\n{error}")
+                return
+            self.status.setText("The AI voice engine is installed.")
+            self._prepare_ai(model)
+
+        Background(self, work, finished, self.status.setText)
+
     def _ai_ready(self, model):
         return model is not None and model["id"] in self.voices
 
     def _prepare_ai(self, model):
+        if not ai_voice_installed() and IS_MAC:
+            self._install_ai_mac(model)
+            return
         if not ai_voice_installed():
             self.status.setText(
                 "AI voices need extra components (PyTorch, about 1 GB). Install them once "
@@ -3081,7 +3214,7 @@ class VoiceDialog(QtWidgets.QDialog):
                 if getattr(voice, "describe", None) and self.helpers is not None:
                     self.helpers._describe = voice.describe  # after GPU tuning
                 pick = self._auto_responsiveness()
-                if self.cfg.get("use_gpu", True) and self.helpers.device != "cuda":
+                if self.cfg.get("use_gpu", True) and self.helpers.device not in ("cuda", "mps"):
                     note += f" (graphics card not used: {self.helpers.gpu_error})"
                 self.status.setText(
                     f"{model['name']} is ready{note}. Running on the {self.helpers.describe()} "
@@ -3217,11 +3350,7 @@ class VoiceDialog(QtWidgets.QDialog):
         tick.start(1000)
 
         def work(_progress):
-            proc = subprocess.Popen(
-                ["parec", f"--device={source}", "--format=float32le", f"--rate={VOICE_RATE}",
-                 "--channels=1", "--latency-msec=20", "--raw",
-                 "--client-name=Blurt voice test"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = open_recording(source, "float32le", VOICE_RATE, 1, 20, "Blurt voice test")
             want = seconds * VOICE_RATE * 4
             data = b""
             try:
@@ -3420,7 +3549,7 @@ class VoiceDialog(QtWidgets.QDialog):
         if self.live.cost > 0.9 or self.live.dropped or self.live.late > 3:
             key = self.cfg["responsiveness"]
             key = self._auto_responsiveness() if key == "auto" else key
-            on_gpu = self.helpers is not None and self.helpers.device == "cuda"
+            on_gpu = self.helpers is not None and self.helpers.device in ("cuda", "mps")
             text += " Your computer is struggling to keep up, so bits get skipped. " + (
                 "Try “Smooth” responsiveness." if key != "smooth" else
                 "Close other heavy programs" + ("." if on_gpu else
@@ -3449,6 +3578,8 @@ PERF_LOG = DATA_DIR / "voice-performance.log"
 
 
 def _cpu_info():
+    if IS_MAC:
+        return macsysinfo.cpu_info()
     info = {"model": "unknown", "mhz": None, "logical": os.cpu_count() or 1, "physical": None}
     try:
         text = Path("/proc/cpuinfo").read_text()
@@ -3467,6 +3598,8 @@ def _cpu_info():
 
 
 def _process_cpu_seconds(pid="self"):
+    if IS_MAC:
+        return macsysinfo.process_cpu_seconds(pid)
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
@@ -3475,6 +3608,8 @@ def _process_cpu_seconds(pid="self"):
 
 
 def _rss_mb(pid="self"):
+    if IS_MAC:
+        return macsysinfo.rss_mb(pid)
     try:
         m = re.search(r"VmRSS:\s+(\d+)", Path(f"/proc/{pid}/status").read_text())
         return int(m.group(1)) // 1024 if m else None
@@ -3578,7 +3713,9 @@ class PerfDialog(QtWidgets.QDialog):
                 top = max(steps, key=lambda r: r[2])
                 hints = {
                     "synthesis": "The voice model itself is the slowest part. The graphics card "
-                                 "helps most (install.sh --ai-voice-gpu). 48 kHz models are "
+                                 "helps most (" + ("tick “Use the graphics card” in the Voice "
+                                 "window" if IS_MAC else "install.sh --ai-voice-gpu") +
+                                 "). 48 kHz models are "
                                  "slower than 40 kHz ones, and “Smooth” responsiveness gives it "
                                  "more time per block.",
                     "features": "Speech features are the slowest part. “Fast” responsiveness "
@@ -3629,7 +3766,7 @@ class PerfDialog(QtWidgets.QDialog):
             h = d.helpers
             lines.append(f"  Voice engine: {h.describe()}, torch {h.torch}, {h.threads} threads "
                          "(separate process)")
-            if h.device == "cuda":
+            if h.device in ("cuda", "mps"):
                 lines.append(f"  Graphics card: {h.gpu_name}")
             else:
                 if self._diag is None:
@@ -4107,7 +4244,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.route_label = W.QLabel(self.router.message)
         self.statusBar().addPermanentWidget(self.route_label)
-        if not self.keys.available:
+        if not self.keys.available and IS_MAC:
+            self.statusBar().showMessage(
+                "For hotkeys in other apps, allow Blurt in Privacy & Security > Input Monitoring.")
+            self.keys.ready.connect(lambda: self.statusBar().showMessage(
+                "Global hotkeys are on: they now work while other apps are focused.", 6000))
+        elif not self.keys.available:
             self.statusBar().showMessage(
                 "Hotkeys only work while this window is focused. For global hotkeys: "
                 "sudo usermod -aG input $USER, then log out and back in.")
@@ -4136,7 +4278,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mic_combo.setCurrentIndex(idx)
         self.apply_mic_routing()
         self.clip_combo.clear()
-        self.clip_combo.addItem("What I hear (the selected output)", "")
+        self.clip_combo.addItem("What I hear (all apps except Blurt)" if IS_MAC else
+                                "What I hear (the selected output)", "")
         for i in range(1, self.mic_combo.count()):
             self.clip_combo.addItem("Microphone: " + self.mic_combo.itemText(i),
                                     self.mic_combo.itemData(i))
@@ -4536,6 +4679,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- clipping --------------------------------------------------------
     def restart_clipper(self):
         source = self.clip_combo.currentData()
+        if IS_MAC:  # what the Mac plays, except Blurt's own sounds (a Core Audio tap)
+            self.clipper.start(source or macaudio.TAP_SOURCE)
+            return
         if not source:  # what plays on the output you listen on
             out = device_id(self.engine.out_me.device())
             if self.tee.active and out:
@@ -4566,8 +4712,15 @@ class MainWindow(QtWidgets.QMainWindow):
         pcm = self.clipper.grab(self.clip_len.value())
         seconds = len(pcm) / (Clipper.RATE * Clipper.FRAME)
         if seconds < 0.05 or pcm.count(0) == len(pcm):
+            hint = ""
+            if IS_MAC and not self.clip_combo.currentData():
+                hint = (" Recording what the Mac plays needs macOS 14.2 or later."
+                        if not macaudio.tap_supported() else
+                        " If it should have, allow Blurt under System Settings > Privacy & "
+                        "Security > Screen & System Audio Recording.")
             self.statusBar().showMessage(
-                f"Nothing to clip - no sound came from “{self.clip_combo.currentText()}”.", 5000)
+                f"Nothing to clip - no sound came from “{self.clip_combo.currentText()}”."
+                + hint, 8000 if hint else 5000)
             return
         CLIPS_DIR.mkdir(parents=True, exist_ok=True)
         path = CLIPS_DIR / f"clip-{uuid.uuid4().hex[:8]}.wav"
@@ -4795,6 +4948,35 @@ class MainWindow(QtWidgets.QMainWindow):
         return False
 
 
+def ensure_mac_driver():
+    """Offer to install (or update) the driver that provides Blurt-Mic on macOS."""
+    from blurt_mac import driver
+    state = driver.status()
+    if state not in ("missing", "outdated"):
+        return
+    if state == "missing":
+        text = ("Blurt needs to install its virtual microphone, “Blurt-Mic”, once. Discord, "
+                "games and other apps hear your sounds through it.\n\nmacOS will ask for "
+                "your password.")
+    else:
+        text = ("This version of Blurt comes with an updated Blurt-Mic driver. Install it "
+                "now?\n\nmacOS will ask for your password.")
+    box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Information, APP, text)
+    install = box.addButton("Install", QtWidgets.QMessageBox.AcceptRole)
+    box.addButton("Not now", QtWidgets.QMessageBox.RejectRole)
+    box.setDefaultButton(install)
+    box.exec()
+    if box.clickedButton() is not install:
+        return
+    QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+    try:
+        ok, msg = driver.install()
+    finally:
+        QtWidgets.QApplication.restoreOverrideCursor()
+    if not ok and msg != "Cancelled.":
+        QtWidgets.QMessageBox.warning(None, APP, msg)
+
+
 def main():
     import faulthandler
     try:  # if Blurt itself ever crashes hard, say where
@@ -4805,6 +4987,8 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setDesktopFileName("blurt")
+    if IS_MAC:
+        ensure_mac_driver()
     store = Store()
     router = Router()
     router.setup()
